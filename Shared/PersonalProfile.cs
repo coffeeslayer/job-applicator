@@ -36,7 +36,10 @@ public sealed record PersonalProfile(
     string? SexualOrientation = null,
     string? TransgenderIdentity = null,
     string? Disability = null,
-    string? ActiveDuty = null)
+    string? ActiveDuty = null,
+    string? PreviouslyEmployedAtBox = null,
+    string? WillingToRelocate = null,
+    string? ResidesInUnitedStates = null)
 {
     private static readonly Regex EntryPattern = new(
         @"(?im)^\s*[-*]?\s*(?<key>[\p{L}][\p{L}\p{N} /_-]*?)\s*:\s*(?<value>.+?)\s*$",
@@ -117,7 +120,10 @@ public sealed record PersonalProfile(
             Read("Sexual orientation"),
             Read("Transgender identity", "Transgender"),
             Read("Disability or chronic condition", "Disability"),
-            Read("Currently active member of the U.S. Armed Forces", "Active duty"));
+            Read("Currently active member of the U.S. Armed Forces", "Active duty"),
+            Read("Previously employed at Box", "Worked at Box"),
+            Read("Willing to relocate or commute to a designated office three days per week", "Willing to relocate"),
+            Read("Currently resides in the United States", "Resides in the United States"));
     }
 
     public string? AnswerForQuestion(string question)
@@ -176,6 +182,26 @@ public sealed record PersonalProfile(
             normalized.Contains("personal website", StringComparison.OrdinalIgnoreCase))
         {
             return LinkedInUrl;
+        }
+        if ((normalized.Contains("employed at box", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("worked at box", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("work for box", StringComparison.OrdinalIgnoreCase)) &&
+            normalized.Contains("ever", StringComparison.OrdinalIgnoreCase))
+        {
+            return PreviouslyEmployedAtBox;
+        }
+        if (normalized.Contains("relocate", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("commute to this position", StringComparison.OrdinalIgnoreCase))
+        {
+            return WillingToRelocate;
+        }
+        if (normalized.Contains("currently reside in the united states", StringComparison.OrdinalIgnoreCase))
+        {
+            return ResidesInUnitedStates;
+        }
+        if (normalized.Contains("consent to process", StringComparison.OrdinalIgnoreCase))
+        {
+            return PrivacyConsent;
         }
         if (normalized.Contains("over 18", StringComparison.OrdinalIgnoreCase) ||
             normalized.Contains("18 years old", StringComparison.OrdinalIgnoreCase))

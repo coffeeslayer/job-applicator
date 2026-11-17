@@ -346,55 +346,14 @@ internal static class Program
         filledCount += await FillFullLegalNameQuestionsAsync(page, fullLegalName);
 
         var authorizationAnswer = personalProfile?.AnswerForQuestion(
-            "Are you legally authorized to work for any employer in the United States?");
+            "Are you authorized to reside and work in the country where this role is based?");
         if (authorizationAnswer is "Yes" or "No")
         {
-            var authorizationQuestion = page.GetByLabel(
-                "Are you legally authorized to work for any employer in the United States?",
-                new() { Exact = true });
-            if (await authorizationQuestion.CountAsync() == 1 && await authorizationQuestion.First.IsVisibleAsync())
-            {
-                var answer = authorizationAnswer;
-                try
-                {
-                    var tagName = await authorizationQuestion.First.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
-                    if (tagName == "select")
-                    {
-                        await authorizationQuestion.First.ScrollIntoViewIfNeededAsync();
-                        await authorizationQuestion.First.SelectOptionAsync(new SelectOptionValue { Label = answer });
-                        filledCount++;
-                    }
-                    else
-                    {
-                        await authorizationQuestion.First.ScrollIntoViewIfNeededAsync();
-                        await authorizationQuestion.First.ClickAsync();
-                        var answerOptions = page.GetByRole(AriaRole.Option, new() { Name = answer, Exact = true });
-                        var visibleAnswerOptions = new List<ILocator>();
-                        for (var index = 0; index < await answerOptions.CountAsync(); index++)
-                        {
-                            var option = answerOptions.Nth(index);
-                            if (await option.IsVisibleAsync())
-                            {
-                                visibleAnswerOptions.Add(option);
-                            }
-                        }
-
-                        if (visibleAnswerOptions.Count == 1)
-                        {
-                            await visibleAnswerOptions[0].ClickAsync();
-                            filledCount++;
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Could not identify a unique {answer} option for the work-authorization question; please answer it manually.");
-                        }
-                    }
-                }
-                catch (PlaywrightException ex)
-                {
-                    Console.WriteLine($"Could not fill the work-authorization answer; please answer it manually. ({ex.Message})");
-                }
-            }
+            filledCount += await FillLabeledBooleanComboboxAsync(
+                page,
+                IsWorkAuthorizationQuestion,
+                authorizationAnswer,
+                "work authorization");
         }
 
         var sponsorshipAnswer = personalProfile?.AnswerForQuestion(
@@ -406,6 +365,16 @@ internal static class Program
                 IsVisaSponsorshipQuestion,
                 sponsorshipAnswer,
                 "visa sponsorship");
+        }
+
+        var veteranAnswer = personalProfile?.VeteranStatus;
+        if (veteranAnswer is "Yes" or "No")
+        {
+            filledCount += await FillLabeledBooleanComboboxAsync(
+                page,
+                label => label.Contains("veteran", StringComparison.OrdinalIgnoreCase),
+                veteranAnswer,
+                "veteran status");
         }
 
         filledCount += await FillUniqueVisibleFieldAsync(page, "Legal First Name", personalProfile?.LegalFirstName);
@@ -537,7 +506,17 @@ internal static class Program
     {
         var normalized = Regex.Replace(label, @"[^\p{L}\p{N}]+", " ").Trim();
         return normalized.Contains("sponsor", StringComparison.OrdinalIgnoreCase)
-            && normalized.Contains("visa", StringComparison.OrdinalIgnoreCase);
+            && (normalized.Contains("visa", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("work", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("employment", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsWorkAuthorizationQuestion(string label)
+    {
+        var normalized = Regex.Replace(label, @"[^\p{L}\p{N}]+", " ").Trim();
+        return normalized.Contains("authoriz", StringComparison.OrdinalIgnoreCase)
+            && (normalized.Contains("work", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("reside", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<int> FillLabeledBooleanComboboxAsync(
@@ -567,54 +546,95 @@ internal static class Program
             }
         }
 
-        if (matches.Count != 1)
+        if (matches.Count == 0)
         {
-            if (matches.Count > 1)
-            {
-                Console.WriteLine($"Found multiple {description} questions; leaving them for manual review.");
-            }
+            return 0;
+        }
+        if (matches.Count > 1 && !description.Equals("veteran status", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"Found multiple {description} questions; leaving them for manual review.");
             return 0;
         }
 
-        try
+        var filledCount = 0;
+        foreach (var match in matches)
         {
-            var tagName = await matches[0].EvaluateAsync<string>("element => element.tagName.toLowerCase()");
-            if (tagName == "select")
+            try
             {
-                await matches[0].ScrollIntoViewIfNeededAsync();
-                await matches[0].SelectOptionAsync(new SelectOptionValue { Label = answer });
-            }
-            else
-            {
-                await matches[0].ScrollIntoViewIfNeededAsync();
-                await matches[0].ClickAsync();
-                var options = page.GetByRole(AriaRole.Option, new() { Name = answer, Exact = true });
-                var visibleOptions = new List<ILocator>();
-                for (var index = 0; index < await options.CountAsync(); index++)
+                await match.ScrollIntoViewIfNeededAsync();
+                var tagName = await match.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
+                if (tagName == "select")
                 {
-                    if (await options.Nth(index).IsVisibleAsync())
+                    var options = match.Locator("option");
+                    string? matchingValue = null;
+                    for (var index = 0; index < await options.CountAsync(); index++)
                     {
-                        visibleOptions.Add(options.Nth(index));
+                        var option = options.Nth(index);
+                        var label = Regex.Replace(await option.InnerTextAsync(), @"\s+", " ").Trim();
+                        if (MatchesRequestedAnswer(answer, label))
+                        {
+                            matchingValue = await option.GetAttributeAsync("value") ?? label;
+                            break;
+                        }
                     }
+                    if (matchingValue is null)
+                    {
+                        Console.WriteLine($"Could not find the {answer} option for {description}; available choices: {string.Join(" | ", await options.AllInnerTextsAsync())}");
+                        continue;
+                    }
+                    await match.SelectOptionAsync(matchingValue);
                 }
-
-                if (visibleOptions.Count != 1)
+                else
                 {
-                    await matches[0].PressAsync("Escape");
-                    Console.WriteLine($"Could not identify a unique {answer} option for {description}; please answer it manually.");
-                    return 0;
-                }
-                await visibleOptions[0].ClickAsync();
-            }
+                    await match.ClickAsync(new LocatorClickOptions { Force = true });
+                    var options = page.Locator("[role='option'], .select__option");
+                    var visibleOptions = new List<ILocator>();
+                    for (var index = 0; index < await options.CountAsync(); index++)
+                    {
+                        var option = options.Nth(index);
+                        if (await option.IsVisibleAsync() && MatchesRequestedAnswer(answer, Regex.Replace(await option.InnerTextAsync(), @"\s+", " ").Trim()))
+                        {
+                            visibleOptions.Add(option);
+                        }
+                    }
 
-            Console.WriteLine($"Answered the {description} question with {answer}.");
-            return 1;
+                    if (visibleOptions.Count != 1)
+                    {
+                        await match.PressAsync("Escape");
+                        Console.WriteLine($"Could not identify a unique {answer} option for {description}; please answer it manually.");
+                        continue;
+                    }
+                    await visibleOptions[0].ClickAsync();
+                }
+
+                await match.EvaluateAsync<bool>(
+                    "(element, value) => { element.setAttribute('data-codex-answered', value); return true; }",
+                    answer);
+
+                Console.WriteLine($"Answered the {description} question with {answer}.");
+                filledCount++;
+            }
+            catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+            {
+                Console.WriteLine($"Could not answer the {description} question; please answer it manually. ({ex.Message})");
+            }
         }
-        catch (PlaywrightException ex)
+        return filledCount;
+    }
+
+    private static bool MatchesRequestedAnswer(string answer, string optionLabel)
+    {
+        var normalizedAnswer = Regex.Replace(answer, @"[^\p{L}\p{N}]+", " ").Trim();
+        var normalizedOption = Regex.Replace(optionLabel, @"[^\p{L}\p{N}]+", " ").Trim();
+        if (normalizedAnswer.Equals(normalizedOption, StringComparison.OrdinalIgnoreCase) ||
+            normalizedOption.StartsWith(normalizedAnswer + " ", StringComparison.OrdinalIgnoreCase))
         {
-            Console.WriteLine($"Could not answer the {description} question; please answer it manually. ({ex.Message})");
-            return 0;
+            return true;
         }
+
+        return normalizedAnswer.Equals("No", StringComparison.OrdinalIgnoreCase) &&
+            (normalizedOption.Contains("not a veteran", StringComparison.OrdinalIgnoreCase) ||
+             normalizedOption.Contains("not a protected veteran", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<int> FillUniqueVisibleFieldAsync(IPage page, string fieldName, string? value)
@@ -753,11 +773,37 @@ internal static class Program
 
     private static async Task CheckGdprConsentIfPresentAsync(IPage page)
     {
-        var consent = page.Locator("input#gdpr_demographic_data_consent_given_1[type='checkbox']");
+        const string consentId = "gdpr_demographic_data_consent_given_1";
+        var consent = page.Locator($"input#{consentId}[type='checkbox']");
         if (await consent.CountAsync() == 1 && await consent.First.IsVisibleAsync() && !await consent.First.IsCheckedAsync())
         {
-            await consent.First.CheckAsync();
-            Console.WriteLine("Checked the specified GDPR demographic-data consent box.");
+            try
+            {
+                await consent.First.CheckAsync();
+            }
+            catch (PlaywrightException)
+            {
+                // Fall back to the rendered label for styled/custom checkboxes.
+            }
+
+            if (!await consent.First.IsCheckedAsync())
+            {
+                var label = page.Locator($"label[for='{consentId}']");
+                if (await label.CountAsync() == 1 && await label.First.IsVisibleAsync())
+                {
+                    try { await label.First.ClickAsync(); }
+                    catch (PlaywrightException) { }
+                }
+            }
+
+            if (await consent.First.IsCheckedAsync())
+            {
+                Console.WriteLine("Checked the specified GDPR demographic-data consent box.");
+            }
+            else
+            {
+                Console.WriteLine("The GDPR demographic-data consent box still needs your attention in the form.");
+            }
         }
     }
 

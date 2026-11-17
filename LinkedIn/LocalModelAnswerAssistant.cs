@@ -360,6 +360,11 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
 
+            if (!string.IsNullOrWhiteSpace(await field.GetAttributeAsync("data-codex-answered")))
+            {
+                continue;
+            }
+
             await field.ScrollIntoViewIfNeededAsync();
 
             var type = (await field.GetAttributeAsync("type") ?? "").ToLowerInvariant();
@@ -629,6 +634,11 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
 
+            if (!string.IsNullOrWhiteSpace(await field.GetAttributeAsync("data-codex-answered")))
+            {
+                continue;
+            }
+
             await field.ScrollIntoViewIfNeededAsync();
 
             var current = await field.InputValueAsync();
@@ -673,7 +683,7 @@ public static class ExternalApplicationFormAssistant
             {
                 try
                 {
-                    await field.FocusAsync();
+                    await field.ClickAsync(new LocatorClickOptions { Force = true });
                     await field.FillAsync(answer);
                     await field.PressAsync("ArrowDown");
                     await page.WaitForTimeoutAsync(250);
