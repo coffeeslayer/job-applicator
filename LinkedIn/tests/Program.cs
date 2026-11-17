@@ -18,7 +18,7 @@ static class AnswerMatcherTests
             ("suggests only configured, resume-supported answers", SuggestsConfiguredResumeAnswers),
             ("does not suggest answers for unsupported or sensitive questions", LeavesUnsupportedResumeAnswersBlank),
             ("suggests answers only when the field is blank", SuggestsAnswersOnlyForBlankFields),
-            ("resolves resume.md at the project root", ResolvesProjectRootResumePath),
+            ("resolves repository-root resume.md", ResolvesProjectRootResumePath),
             ("keeps the scan session available until explicit exit", HandlesPostScanActions),
             ("discovers listings from card attributes and job links", DiscoversJobListings),
             ("separates result cards from the selected details job ID", DistinguishesResultCardsFromDetails),
@@ -203,17 +203,18 @@ static class AnswerMatcherTests
     private static void ResolvesProjectRootResumePath()
     {
         var root = Path.Combine(Path.GetTempPath(), $"LinkedInJobSearchTests-{Guid.NewGuid():N}");
-        var executableDirectory = Path.Combine(root, "bin", "Debug", "net8.0");
+        var linkedinProject = Path.Combine(root, "LinkedIn");
+        var executableDirectory = Path.Combine(linkedinProject, "bin", "Debug", "net8.0");
         Directory.CreateDirectory(executableDirectory);
         try
         {
-            File.WriteAllText(Path.Combine(root, "LinkedInJobSearch.csproj"), "");
+            File.WriteAllText(Path.Combine(linkedinProject, "LinkedInJobSearch.csproj"), "");
             Equal(
-                root,
+                linkedinProject,
                 ResumePaths.FindProjectRoot(executableDirectory, Path.GetTempPath()));
             Equal(
                 Path.Combine(root, "resume.md"),
-                ResumePaths.GetResumePath(root));
+                ResumePaths.GetResumePath(linkedinProject));
         }
         finally
         {

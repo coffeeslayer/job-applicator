@@ -9,11 +9,13 @@ public sealed record ConfirmedAnswer(
 public enum AnswerSuggestionKind
 {
     None,
+    SavedKeyValueAnswer,
     PreviousAnswer,
     ResumeAnswer,
     ResumeAnswerUnavailable,
     ResumeExcerpt,
     SensitiveQuestion,
+    AmbiguousQuestionAnswers,
     AmbiguousPreviousAnswers,
     AmbiguousResumeExcerpts
 }
@@ -33,7 +35,7 @@ public static class AnswerMatcher
 
     private static readonly Regex WordPattern = new(@"[\p{L}\p{N}]+", RegexOptions.Compiled);
     private static readonly Regex SensitivePattern = new(
-        @"\b(work authorization|employment authorization|authorized to work|eligible to work|right to work|work permit|visa|immigration|sponsor(?:ship)?|citizenship|nationality|social security|ssn|disability|disabled|veteran|military service|criminal|convict(?:ion|ed|ions)|background check|clearance|salary|compensation|pay range|pay expectations|expected pay|desired pay|hourly rate|race|ethnicity|gender|sex|sexual orientation|religion|marital status|age|date of birth|demographic|equal employment|eeo|protected class|email|phone|mobile|telephone|street address|home address|contact information)\b",
+        @"\b(work authorization|employment authorization|authorized to work|eligible to work|right to work|work permit|visa|immigration|sponsor(?:ship)?|citizenship|nationality|social security|ssn|disability|disabled|veteran|military service|criminal|convict(?:ion|ed|ions)|background check|clearance|salary|compensation|pay range|pay expectations|expected pay|desired pay|hourly rate|race|ethnicity|gender|sex|pronoun|privacy|integrity|c2c|1099|recruiter representation|sexual orientation|religion|marital status|age|date of birth|demographic|equal employment|eeo|protected class|email|phone|mobile|telephone|street address|home address|contact information)\b",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly HashSet<string> StopWords = new(StringComparer.Ordinal)
@@ -385,6 +387,117 @@ public sealed class ConfirmedAnswerStore
 
         File.Move(temporaryPath, path, overwrite: true);
     }
+}
+
+public sealed class QuestionAnswerStore
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private readonly Dictionary<string, string> answers;
+
+    private QuestionAnswerStore(Dictionary<string, string> answers) => this.answers = answers;
+
+    public int Count => answers.Count;
+
+    public static async Task<QuestionAnswerStore> LoadAsync(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return new QuestionAnswerStore(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        }
+
+        await using var stream = File.OpenRead(path);
+        var loaded = await JsonSerializer.DeserializeAsync<Dictionary<string, string>>(stream, JsonOptions);
+        return new QuestionAnswerStore(
+            new Dictionary<string, string>(loaded ?? new Dictionary<string, string>(), StringComparer.OrdinalIgnoreCase));
+    }
+
+    public bool ContainsExactQuestion(string question)
+    {
+        var normalizedQuestion = NormalizeKey(question);
+        return answers.Keys.Any(key => NormalizeKey(key) == normalizedQuestion);
+    }
+
+    public AnswerSuggestion FindAnswer(string question)
+    {
+        if (string.IsNullOrWhiteSpace(question))
+        {
+            return new AnswerSuggestion(AnswerSuggestionKind.None, null, 0);
+        }
+
+        var normalizedQuestion = NormalizeKey(question);
+        var exact = answers.FirstOrDefault(entry => NormalizeKey(entry.Key) == normalizedQuestion);
+        if (!string.IsNullOrWhiteSpace(exact.Key))
+        {
+            return new AnswerSuggestion(
+                AnswerSuggestionKind.SavedKeyValueAnswer,
+                exact.Value,
+                1,
+                exact.Key);
+        }
+
+        var matches = answers
+            .Where(entry => !string.IsNullOrWhiteSpace(entry.Key) && !string.IsNullOrWhiteSpace(entry.Value))
+            .Select(entry => new { Entry = entry, Score = AnswerMatcher.Similarity(question, entry.Key) })
+            .Where(match => match.Score >= AnswerMatcher.PreviousAnswerThreshold)
+            .OrderByDescending(match => match.Score)
+            .ThenBy(match => NormalizeKey(match.Entry.Key), StringComparer.Ordinal)
+            .ToList();
+        if (matches.Count == 0)
+        {
+            return new AnswerSuggestion(AnswerSuggestionKind.None, null, 0);
+        }
+
+        var best = matches[0];
+        var competingAnswers = matches
+            .Where(match => best.Score - match.Score <= AnswerMatcher.AmbiguityMargin)
+            .Select(match => match.Entry)
+            .GroupBy(entry => AnswerMatcher.Normalize(entry.Value), StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToList();
+        if (competingAnswers.Count > 1)
+        {
+            return new AnswerSuggestion(
+                AnswerSuggestionKind.AmbiguousQuestionAnswers,
+                null,
+                best.Score,
+                ConflictingAnswers: competingAnswers
+                    .Select(entry => new ConfirmedAnswer(entry.Key, entry.Value, DateTimeOffset.MinValue))
+                    .ToList());
+        }
+
+        return new AnswerSuggestion(
+            AnswerSuggestionKind.SavedKeyValueAnswer,
+            best.Entry.Value,
+            best.Score,
+            best.Entry.Key);
+    }
+
+    public async Task AddAndSaveAsync(string path, string question, string answer)
+    {
+        var key = question.Trim();
+        var existingKey = answers.Keys.FirstOrDefault(savedKey => NormalizeKey(savedKey) == NormalizeKey(key));
+        answers[existingKey ?? key] = answer.Trim();
+
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var temporaryPath = path + ".tmp";
+        await using (var stream = File.Create(temporaryPath))
+        {
+            await JsonSerializer.SerializeAsync(
+                stream,
+                answers.OrderBy(entry => entry.Key, StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(entry => entry.Key, entry => entry.Value),
+                JsonOptions);
+        }
+
+        File.Move(temporaryPath, path, overwrite: true);
+    }
+
+    private static string NormalizeKey(string value) => AnswerMatcher.Normalize(value ?? "");
 }
 
 public sealed class ResumeAnswerStore

@@ -56,7 +56,7 @@ public sealed record LocalAnswerDraft(string? Answer, string Evidence, string Re
 public sealed class LocalModelAnswerClient : IDisposable
 {
     private static readonly Regex HighImpactQuestion = new(
-        @"\b(work authorization|employment authorization|authorized to work|eligible to work|right to work|work permit|visa|immigration|sponsor(?:ship)?|citizenship|nationality|disability|disabled|veteran|military service|criminal|convict(?:ion|ed|ions)|background check|clearance|salary|compensation|pay range|pay expectations|expected pay|desired pay|hourly rate|race|ethnicity|gender|sex|sexual orientation|religion|marital status|age|date of birth|demographic|equal employment|eeo|protected class)\b",
+        @"\b(work authorization|employment authorization|authorized to work|eligible to work|right to work|work permit|visa|immigration|sponsor(?:ship)?|citizenship|nationality|disability|disabled|veteran|military service|criminal|convict(?:ion|ed|ions)|background check|clearance|salary|compensation|pay range|pay expectations|expected pay|desired pay|hourly rate|race|ethnicity|gender|sex|pronoun|privacy|integrity|c2c|1099|represented by a recruiter|recruiter representation|sexual orientation|religion|marital status|age|date of birth|demographic|equal employment|eeo|protected class)\b",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -266,20 +266,44 @@ public static class ExternalApplicationFormAssistant
         LocalModelAnswerClient? model,
         string jobTitle,
         string resumeText,
-        CancellationToken cancellationToken)
+        string? residenceCityStateZip,
+        CancellationToken cancellationToken,
+        PersonalProfile? personalProfile = null)
     {
         var formTitle = await page.TitleAsync();
-        var fields = page.Locator(FieldSelector);
+        ILocator formRoot = page.Locator("body");
+        var dialogs = page.GetByRole(AriaRole.Dialog);
+        for (var index = 0; index < await dialogs.CountAsync(); index++)
+        {
+            var dialog = dialogs.Nth(index);
+            if (await dialog.IsVisibleAsync())
+            {
+                formRoot = dialog;
+            }
+        }
+        var fields = formRoot.Locator(FieldSelector);
         var fieldCount = await fields.CountAsync();
-        var draftedCount = 0;
+        var draftedCount = personalProfile is null
+            ? 0
+            : await FillPersonalProfileFieldsAsync(page, formRoot, personalProfile, cancellationToken);
         var unansweredQuestions = new List<string>();
 
-        var choiceFields = page.Locator("input[type='radio'], input[type='checkbox'], input[type='file']");
+        var choiceFields = formRoot.Locator("input[type='radio'], input[type='checkbox'], input[type='file']");
         for (var index = 0; index < await choiceFields.CountAsync(); index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var choice = choiceFields.Nth(index);
-            if (!await choice.IsVisibleAsync() || await choice.IsDisabledAsync())
+            if (await choice.IsDisabledAsync())
+            {
+                continue;
+            }
+            var choiceVisible = await choice.IsVisibleAsync();
+            if (!choiceVisible)
+            {
+                var label = choice.Locator("xpath=ancestor::label[1]");
+                choiceVisible = await label.CountAsync() > 0 && await label.IsVisibleAsync();
+            }
+            if (!choiceVisible)
             {
                 continue;
             }
@@ -307,7 +331,23 @@ public static class ExternalApplicationFormAssistant
                 """);
             if (!string.IsNullOrWhiteSpace(question))
             {
-                unansweredQuestions.Add(question);
+                var choiceType = (await choice.GetAttributeAsync("type") ?? "").ToLowerInvariant();
+                var explicitAnswer = personalProfile?.AnswerForQuestion(question);
+                if (!(choiceType == "checkbox" &&
+                      string.Equals(explicitAnswer, "No", StringComparison.OrdinalIgnoreCase)))
+                {
+                    if (string.IsNullOrWhiteSpace(explicitAnswer) && choiceType == "radio")
+                    {
+                        var options = await choice.EvaluateAsync<string>(
+                            "element => { const name = element.name; const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(item => item.name === name); " +
+                            "return radios.map(item => Array.from(item.labels || []).map(label => label.innerText.trim()).join(' ') || item.value).filter(Boolean).join(' | '); }");
+                        if (!string.IsNullOrWhiteSpace(options))
+                        {
+                            Console.WriteLine($"  Choices for \"{question}\": {options}");
+                        }
+                    }
+                    unansweredQuestions.Add(question);
+                }
             }
         }
 
@@ -319,6 +359,8 @@ public static class ExternalApplicationFormAssistant
             {
                 continue;
             }
+
+            await field.ScrollIntoViewIfNeededAsync();
 
             var type = (await field.GetAttributeAsync("type") ?? "").ToLowerInvariant();
             var tag = await field.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
@@ -335,12 +377,47 @@ public static class ExternalApplicationFormAssistant
                 type = "text";
             }
             var currentValue = await field.InputValueAsync();
+            var question = await GetFieldQuestionAsync(field);
+            if (string.Equals(
+                    AnswerMatcher.Normalize(question),
+                    "search for a job title",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (ResidenceQuestion.IsMatch(question) && !string.IsNullOrWhiteSpace(residenceCityStateZip))
+            {
+                if (type == "select")
+                {
+                    var matchingOption = await FindMatchingSelectOptionAsync(field, residenceCityStateZip);
+                    if (matchingOption is not null)
+                    {
+                        await field.SelectOptionAsync(matchingOption.Value.Value);
+                        draftedCount++;
+                    }
+                    else
+                    {
+                        var choices = await GetSelectOptionsAsync(field);
+                        if (choices.Count > 0)
+                        {
+                            Console.WriteLine($"  Available choices for \"{question}\": {string.Join(" | ", choices)}");
+                        }
+                        unansweredQuestions.Add(question);
+                    }
+                }
+                else
+                {
+                    await field.FillAsync(residenceCityStateZip);
+                    draftedCount++;
+                }
+                continue;
+            }
+
             if (!string.IsNullOrWhiteSpace(currentValue))
             {
                 continue;
             }
 
-            var question = await GetFieldQuestionAsync(field);
             if (string.IsNullOrWhiteSpace(question) ||
                 LocalModelAnswerClient.IsHighImpactQuestion(question))
             {
@@ -400,6 +477,11 @@ public static class ExternalApplicationFormAssistant
                 if (matchingOption is null)
                 {
                     Console.WriteLine("  The answer does not match an available option; leaving the field unchanged.");
+                    var choices = await GetSelectOptionsAsync(field);
+                    if (choices.Count > 0)
+                    {
+                        Console.WriteLine($"  Available choices for \"{question}\": {string.Join(" | ", choices)}");
+                    }
                     unansweredQuestions.Add(question);
                     continue;
                 }
@@ -414,6 +496,275 @@ public static class ExternalApplicationFormAssistant
         }
 
         return new ExternalDraftResult(draftedCount, unansweredQuestions.Distinct(StringComparer.Ordinal).ToList());
+    }
+
+    private static async Task<int> FillPersonalProfileFieldsAsync(
+        IPage page,
+        ILocator formRoot,
+        PersonalProfile profile,
+        CancellationToken cancellationToken)
+    {
+        var filledCount = 0;
+        var radios = formRoot.Locator("input[type='radio']");
+        var seenGroups = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < await radios.CountAsync(); index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var radio = radios.Nth(index);
+            if (await radio.IsDisabledAsync())
+            {
+                continue;
+            }
+            var radioVisible = await radio.IsVisibleAsync();
+            var radioLabel = radio.Locator("xpath=ancestor::label[1]");
+            if (!radioVisible && (await radioLabel.CountAsync() == 0 || !await radioLabel.IsVisibleAsync()))
+            {
+                continue;
+            }
+
+            var name = await radio.GetAttributeAsync("name") ?? $"radio-{index}";
+            if (!seenGroups.Add(name))
+            {
+                continue;
+            }
+
+            var question = await radio.EvaluateAsync<string>(
+                "element => { const group = element.closest('fieldset, [role=group], .field, .form-field, .application-question, [class*=question]'); " +
+                "return (group?.innerText || element.getAttribute('aria-label') || '').trim(); }");
+            var answer = profile.AnswerForQuestion(question);
+            if (string.IsNullOrWhiteSpace(answer))
+            {
+                continue;
+            }
+
+            var group = page.Locator("input[type='radio']");
+            var matches = new List<ILocator>();
+            for (var optionIndex = 0; optionIndex < await group.CountAsync(); optionIndex++)
+            {
+                var option = group.Nth(optionIndex);
+                if (!string.Equals(await option.GetAttributeAsync("name") ?? $"radio-{optionIndex}", name, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var label = await option.EvaluateAsync<string>(
+                    "element => { const labels = Array.from(element.labels || []).map(item => item.innerText.trim()); " +
+                    "return [element.getAttribute('aria-label') || '', element.value || '', ...labels].filter(Boolean).join(' '); }");
+                if (AnswersEqual(answer, label))
+                {
+                    matches.Add(option);
+                }
+            }
+
+            if (matches.Count == 1)
+            {
+                if (await matches[0].IsVisibleAsync())
+                {
+                    await matches[0].CheckAsync();
+                }
+                else
+                {
+                    var label = matches[0].Locator("xpath=ancestor::label[1]");
+                    if (await label.CountAsync() == 0 || !await label.IsVisibleAsync())
+                    {
+                        continue;
+                    }
+                    await label.ClickAsync();
+                }
+                if (await matches[0].IsCheckedAsync())
+                {
+                    filledCount++;
+                }
+            }
+            else
+            {
+                var options = await radio.EvaluateAsync<string>(
+                    "element => { const name = element.name; const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(item => item.name === name); " +
+                    "return radios.map(item => Array.from(item.labels || []).map(label => label.innerText.trim()).join(' ') || item.value).filter(Boolean).join(' | '); }");
+                Console.WriteLine($"  No unique option matched \"{answer}\" for \"{question}\". Choices: {options}");
+            }
+        }
+
+        var checkboxes = formRoot.Locator("input[type='checkbox']");
+        for (var index = 0; index < await checkboxes.CountAsync(); index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var checkbox = checkboxes.Nth(index);
+            if (await checkbox.IsDisabledAsync() || await checkbox.IsCheckedAsync())
+            {
+                continue;
+            }
+            var checkboxVisible = await checkbox.IsVisibleAsync();
+            var checkboxLabel = checkbox.Locator("xpath=ancestor::label[1]");
+            if (!checkboxVisible && (await checkboxLabel.CountAsync() == 0 || !await checkboxLabel.IsVisibleAsync()))
+            {
+                continue;
+            }
+
+            var question = await GetFieldQuestionAsync(checkbox);
+            var answer = profile.AnswerForQuestion(question);
+            if (answer is null || !new[] { "Yes", "Agree", "True" }.Contains(answer, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (checkboxVisible)
+            {
+                await checkbox.CheckAsync();
+            }
+            else
+            {
+                await checkboxLabel.ClickAsync();
+            }
+            filledCount++;
+        }
+
+        var fields = formRoot.Locator(FieldSelector);
+        for (var index = 0; index < await fields.CountAsync(); index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var field = fields.Nth(index);
+            if (!await field.IsVisibleAsync() || await field.IsDisabledAsync())
+            {
+                continue;
+            }
+
+            await field.ScrollIntoViewIfNeededAsync();
+
+            var current = await field.InputValueAsync();
+            if (!string.IsNullOrWhiteSpace(current))
+            {
+                continue;
+            }
+            if (string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
+            {
+                var selectedValue = await field.EvaluateAsync<string>(
+                    "element => element.closest('.select__control')?.querySelector('[class*=\"single-value\"]')?.innerText || " +
+                    "element.parentElement?.parentElement?.querySelector('[class*=\"single-value\"]')?.innerText || ''");
+                if (!string.IsNullOrWhiteSpace(selectedValue))
+                {
+                    continue;
+                }
+            }
+
+            var question = await GetFieldQuestionAsync(field);
+            var answer = profile.AnswerForQuestion(question);
+            if (string.IsNullOrWhiteSpace(answer))
+            {
+                continue;
+            }
+
+            var tag = await field.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
+            if (tag == "select")
+            {
+                var option = await FindMatchingSelectOptionAsync(field, answer);
+                if (option is null)
+                {
+                    var choices = await GetSelectOptionsAsync(field);
+                    if (choices.Count > 0)
+                    {
+                        Console.WriteLine($"  Available choices for \"{await GetFieldQuestionAsync(field)}\": {string.Join(" | ", choices)}");
+                    }
+                    continue;
+                }
+                await field.SelectOptionAsync(option.Value.Value);
+            }
+            else if (string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    await field.FocusAsync();
+                    await field.FillAsync(answer);
+                    await field.PressAsync("ArrowDown");
+                    await page.WaitForTimeoutAsync(250);
+                    var options = page.Locator("[role='option'], .select__option");
+                    var matchingOptions = new List<ILocator>();
+                    var availableOptions = new List<string>();
+                    for (var optionIndex = 0; optionIndex < await options.CountAsync(); optionIndex++)
+                    {
+                        var option = options.Nth(optionIndex);
+                        if (!await option.IsVisibleAsync())
+                        {
+                            continue;
+                        }
+                        var label = Regex.Replace(await option.InnerTextAsync(), @"\s+", " ").Trim();
+                        if (label.Length > 0)
+                        {
+                            availableOptions.Add(label);
+                            if (AnswersEqual(answer, label))
+                            {
+                                matchingOptions.Add(option);
+                            }
+                        }
+                    }
+
+                    if (matchingOptions.Count == 1)
+                    {
+                        await matchingOptions[0].ClickAsync();
+                        filledCount++;
+                    }
+                    else
+                    {
+                        await field.PressAsync("Escape");
+                        Console.WriteLine($"  Could not select a unique option for \"{question}\" from the available choices: {string.Join(" | ", availableOptions)}");
+                        await field.FillAsync("");
+                    }
+                }
+                catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
+                {
+                    Console.WriteLine($"  Could not select a matching option for \"{question}\": {ex.Message}");
+                    try { await field.FillAsync(""); }
+                    catch (Exception clearError) when (clearError is PlaywrightException or TimeoutException) { }
+                }
+            }
+            else
+            {
+                var inputType = (await field.GetAttributeAsync("type") ?? "").ToLowerInvariant();
+                if (inputType == "number")
+                {
+                    var numericAnswer = Regex.Replace(answer, @"[^\d.\-]", "");
+                    if (numericAnswer.Length == 0)
+                    {
+                        continue;
+                    }
+                    await field.FillAsync(numericAnswer);
+                }
+                else
+                {
+                    await field.FillAsync(answer);
+                }
+            }
+            if (!string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
+            {
+                filledCount++;
+            }
+        }
+
+        if (filledCount > 0)
+        {
+            Console.WriteLine($"  Filled {filledCount} field(s) using explicit answers from personal.md.");
+        }
+        return filledCount;
+    }
+
+    private static bool AnswersEqual(string answer, string option)
+    {
+        var normalizedAnswer = AnswerMatcher.Normalize(answer);
+        var normalizedOption = AnswerMatcher.Normalize(option);
+        if (normalizedAnswer.Replace(" or ", " ", StringComparison.Ordinal) ==
+            normalizedOption.Replace(" or ", " ", StringComparison.Ordinal))
+        {
+            return normalizedAnswer.Length > 0;
+        }
+        if ((normalizedAnswer == "male" && normalizedOption == "man") ||
+            (normalizedAnswer == "female" && normalizedOption == "woman"))
+        {
+            return true;
+        }
+        return normalizedAnswer.Length > 0 &&
+            (normalizedAnswer == normalizedOption ||
+             normalizedOption.StartsWith(normalizedAnswer + " ", StringComparison.Ordinal) ||
+             normalizedOption.EndsWith(" " + normalizedAnswer, StringComparison.Ordinal));
     }
 
     private static async Task<string> GetFieldQuestionAsync(ILocator field) =>
@@ -432,6 +783,10 @@ public static class ExternalApplicationFormAssistant
                     || element.getAttribute('placeholder') || element.getAttribute('name') || '';
             }
             """);
+
+    private static readonly Regex ResidenceQuestion = new(
+        @"city\s*,\s*state\s+and\s+zip[\s\S]*currently residing",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static async Task<List<string>> GetSelectOptionsAsync(ILocator field)
     {

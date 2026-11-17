@@ -1,4 +1,8 @@
 .env
+personal.md
+resume.md
 .dice-application-state.json
 .linkedin-application-state.json
 __pycache__/
+bin/
+obj/

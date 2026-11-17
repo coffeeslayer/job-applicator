@@ -8,4 +8,9 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Playwright" Version="1.52.0" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\Shared\PersonalProfile.cs" Link="PersonalProfile.cs" />
+    <Compile Include="..\LinkedIn\AnswerAssistant.cs" Link="AnswerAssistant.cs" />
+    <Compile Include="..\LinkedIn\LocalModelAnswerAssistant.cs" Link="LocalModelAnswerAssistant.cs" />
+  </ItemGroup>
 </Project>

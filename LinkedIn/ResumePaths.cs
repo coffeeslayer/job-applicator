@@ -3,7 +3,7 @@ public static class ResumePaths
     public const string ResumeFileName = "resume.md";
 
     public static string GetResumePath(string projectRoot) =>
-        Path.Combine(projectRoot, ResumeFileName);
+        Path.Combine(Directory.GetParent(projectRoot)?.FullName ?? projectRoot, ResumeFileName);
 
     public static string FindProjectRoot(params string[] startingPaths)
     {
@@ -22,6 +22,6 @@ public static class ResumePaths
         }
 
         throw new DirectoryNotFoundException(
-            "Could not locate LinkedInJobSearch.csproj to resolve the project-root resume.md file.");
+            "Could not locate LinkedInJobSearch.csproj to resolve the repository-root resume.md file.");
     }
 }

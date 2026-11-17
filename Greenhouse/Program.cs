@@ -9,6 +9,8 @@ internal static class Program
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly Regex JobPath = new(@"/jobs/(?!search(?:[/?#]|$))[^/?#]+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex SkippedApplicationHost = new(@"talenthop|bestjobtool", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex ResidenceQuestion = new(@"city\s*,\s*state\s+and\s+zip[\s\S]*currently residing", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public static async Task<int> Main()
     {
@@ -25,14 +27,42 @@ internal static class Program
             "GreenhouseJobSearch");
         var profileDirectory = Path.Combine(dataDirectory, "PlaywrightProfile");
         var appliedJobsPath = Path.Combine(dataDirectory, "applied-jobs.json");
-        var personalDataPath = FindPersonalDataPath();
-        var personalData = await LoadPersonalDataAsync(personalDataPath);
+        var personalProfilePath = PersonalProfile.FindPath(Environment.CurrentDirectory, AppContext.BaseDirectory);
+        var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
+        var projectRoot = Path.GetDirectoryName(personalProfilePath)!;
+        var resumePath = Path.Combine(projectRoot, "resume.md");
+        var resumeText = File.Exists(resumePath) ? await File.ReadAllTextAsync(resumePath) : "";
+        LocalModelAnswerClient? localModel = null;
+        var modelConfiguration = LocalModelConfiguration.FromEnvironment();
+        if (modelConfiguration is not null)
+        {
+            localModel = new LocalModelAnswerClient(modelConfiguration);
+            try
+            {
+                if (!await localModel.IsAvailableAsync(cancellation.Token))
+                {
+                    Console.WriteLine("The configured local model endpoint is unavailable; resume-grounded drafts are disabled for this run.");
+                    localModel.Dispose();
+                    localModel = null;
+                }
+            }
+            catch (HttpRequestException)
+            {
+                Console.WriteLine("The configured local model endpoint is unavailable; resume-grounded drafts are disabled for this run.");
+                localModel?.Dispose();
+                localModel = null;
+            }
+        }
+        else
+        {
+            Console.WriteLine("No local model configured; unsupported questions will be left for manual review.");
+        }
         Directory.CreateDirectory(profileDirectory);
         var appliedJobs = await LoadAppliedJobsAsync(appliedJobsPath);
 
-        if (personalData is null)
+        if (personalProfile is null)
         {
-            Console.WriteLine($"Personal settings were not found at {personalDataPath}. Copy personal.example.json to personal.json and fill it in.");
+            Console.WriteLine($"Personal settings were not found at {personalProfilePath}. Create personal.md with your application answers.");
         }
 
         Console.WriteLine($"Applied jobs are tracked in {appliedJobsPath} ({appliedJobs.Count} recorded).");
@@ -40,6 +70,7 @@ internal static class Program
 
         using var playwright = await Playwright.CreateAsync();
         IBrowserContext? context = null;
+        var keepJobPagesForTroubleshooting = false;
         try
         {
             context = await playwright.Chromium.LaunchPersistentContextAsync(
@@ -47,7 +78,7 @@ internal static class Program
                 new BrowserTypeLaunchPersistentContextOptions { Headless = false });
             var searchPage = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
             await searchPage.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
-            var waitingForVerificationCode = await PrepareGreenhouseSignInAsync(searchPage, personalData);
+            var waitingForVerificationCode = await PrepareGreenhouseSignInAsync(searchPage, personalProfile);
 
             Console.WriteLine();
             Console.WriteLine("Greenhouse search opened with the requested filters:");
@@ -89,6 +120,11 @@ internal static class Program
                 foreach (var listing in newListings)
                 {
                     cancellation.Token.ThrowIfCancellationRequested();
+                    if (ShouldSkipApplicationUrl(listing.Url))
+                    {
+                        Console.WriteLine($"Skipping excluded application URL: {listing.Url}");
+                        continue;
+                    }
                     if (appliedJobs.Contains(listing.Url))
                     {
                         Console.WriteLine($"Skipping previously recorded application: {listing.Title}");
@@ -102,10 +138,15 @@ internal static class Program
                     try
                     {
                         await jobPage.GotoAsync(listing.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+                        if (ShouldSkipApplicationUrl(jobPage.Url))
+                        {
+                            Console.WriteLine($"Skipping excluded application URL after navigation: {jobPage.Url}");
+                            continue;
+                        }
                         var applyControls = await FindVisibleApplyControlsAsync(jobPage);
                         if (applyControls.Count == 1)
                         {
-                            Console.WriteLine("Opening the unique Apply control. Review the application and submit it yourself.");
+                            Console.WriteLine("Opening the unique Apply control. The app will fill recognized fields and submit when required fields are valid.");
                             var pagesBeforeApply = context.Pages.ToHashSet();
                             await applyControls[0].ClickAsync(new LocatorClickOptions { Timeout = 5000 });
                             await jobPage.WaitForTimeoutAsync(800);
@@ -115,14 +156,30 @@ internal static class Program
                                 Console.WriteLine("The application opened in a separate browser tab.");
                             }
                             var applicationPage = applicationPopup ?? jobPage;
-                            var filledFields = await FillRequestedApplicationFieldsAsync(applicationPage, personalData);
-                            if (filledFields > 0)
+                            if (ShouldSkipApplicationUrl(applicationPage.Url))
                             {
-                                Console.WriteLine($"Filled {filledFields} requested application field(s). Review them before continuing.");
+                                Console.WriteLine($"Skipping excluded application URL: {applicationPage.Url}");
+                                continue;
                             }
                             await SelectLinkedInReferralAsync(applicationPage);
                             await CheckGdprConsentIfPresentAsync(applicationPage);
-                            var submitted = await OfferApplicationSubmissionAsync(applicationPage, listing.Title);
+                            var fillResult = await FillRequestedApplicationFieldsAsync(
+                                applicationPage,
+                                personalProfile,
+                                string.IsNullOrWhiteSpace(resumeText) ? null : localModel,
+                                resumeText,
+                                listing.Title,
+                                cancellation.Token);
+                            if (fillResult.FilledCount > 0)
+                            {
+                                Console.WriteLine($"Filled {fillResult.FilledCount} recognized application field(s).");
+                            }
+                            var submitted = fillResult.AllQuestionsAnswered &&
+                                await OfferApplicationSubmissionAsync(applicationPage, listing.Title);
+                            if (!fillResult.AllQuestionsAnswered)
+                            {
+                                Console.WriteLine("Some questions were not supported by personal.md or resume.md. Leaving the form for manual review instead of submitting.");
+                            }
                             if (submitted && await HasSubmissionConfirmationAsync(applicationPage))
                             {
                                 appliedJobs.Add(listing.Url);
@@ -164,13 +221,18 @@ internal static class Program
                             return 0;
                         }
                     }
+                    catch
+                    {
+                        keepJobPagesForTroubleshooting = true;
+                        throw;
+                    }
                     finally
                     {
-                        if (applicationPopup is not null && !applicationPopup.IsClosed)
+                        if (!keepJobPagesForTroubleshooting && applicationPopup is not null && !applicationPopup.IsClosed)
                         {
                             await applicationPopup.CloseAsync();
                         }
-                        if (!jobPage.IsClosed)
+                        if (!keepJobPagesForTroubleshooting && !jobPage.IsClosed)
                         {
                             await jobPage.CloseAsync();
                         }
@@ -194,9 +256,15 @@ internal static class Program
             Console.WriteLine("Run cancelled.");
             return 0;
         }
-        catch (PlaywrightException ex)
+        catch (Exception ex)
         {
-            Console.Error.WriteLine($"Playwright could not complete the run: {ex.Message}");
+            Console.Error.WriteLine("Greenhouse runner failed with an exception:");
+            Console.Error.WriteLine(ex.ToString());
+            if (context is not null)
+            {
+                Console.WriteLine("Chromium and the failed application tab are being kept open for troubleshooting. Press Enter after inspecting them to close the browser and exit.");
+                await Console.In.ReadLineAsync();
+            }
             return 1;
         }
         finally
@@ -206,10 +274,11 @@ internal static class Program
             {
                 await context.CloseAsync();
             }
+            localModel?.Dispose();
         }
     }
 
-    private static async Task<bool> PrepareGreenhouseSignInAsync(IPage page, PersonalData? personalData)
+    private static async Task<bool> PrepareGreenhouseSignInAsync(IPage page, PersonalProfile? personalProfile)
     {
         var cookieButtons = page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex("^ok$", RegexOptions.IgnoreCase) });
         if (await cookieButtons.CountAsync() == 1 && await cookieButtons.First.IsVisibleAsync())
@@ -239,13 +308,13 @@ internal static class Program
             return true;
         }
 
-        if (string.IsNullOrWhiteSpace(personalData?.Email))
+        if (string.IsNullOrWhiteSpace(personalProfile?.Email))
         {
             Console.WriteLine("Personal settings do not contain an email. Enter it and request the Greenhouse security code in the browser.");
             return true;
         }
 
-        await visibleEmailFields[0].FillAsync(personalData.Email);
+        await visibleEmailFields[0].FillAsync(personalProfile.Email);
         var sendCodeButtons = page.GetByRole(
             AriaRole.Button,
             new() { NameRegex = new Regex("^send security code$", RegexOptions.IgnoreCase) });
@@ -260,36 +329,44 @@ internal static class Program
         return true;
     }
 
-    private static async Task<int> FillRequestedApplicationFieldsAsync(IPage page, PersonalData? personalData)
+    private static async Task<ApplicationFieldFillResult> FillRequestedApplicationFieldsAsync(
+        IPage page,
+        PersonalProfile? personalProfile,
+        LocalModelAnswerClient? localModel,
+        string resumeText,
+        string jobTitle,
+        CancellationToken cancellationToken)
     {
-        if (personalData is null)
-        {
-            return 0;
-        }
-
         var filledCount = 0;
-        var fullLegalName = string.Join(' ', new[] { personalData.LegalFirstName, personalData.LegalLastName }
+        filledCount += await FillResidenceQuestionAsync(
+            page,
+            personalProfile?.Residence);
+        var fullLegalName = string.Join(' ', new[] { personalProfile?.LegalFirstName, personalProfile?.LegalLastName }
             .Where(value => !string.IsNullOrWhiteSpace(value)));
         filledCount += await FillFullLegalNameQuestionsAsync(page, fullLegalName);
 
-        if (personalData.AuthorizedToWorkInUs is bool authorized)
+        var authorizationAnswer = personalProfile?.AnswerForQuestion(
+            "Are you legally authorized to work for any employer in the United States?");
+        if (authorizationAnswer is "Yes" or "No")
         {
             var authorizationQuestion = page.GetByLabel(
                 "Are you legally authorized to work for any employer in the United States?",
                 new() { Exact = true });
             if (await authorizationQuestion.CountAsync() == 1 && await authorizationQuestion.First.IsVisibleAsync())
             {
-                var answer = authorized ? "Yes" : "No";
+                var answer = authorizationAnswer;
                 try
                 {
                     var tagName = await authorizationQuestion.First.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
                     if (tagName == "select")
                     {
+                        await authorizationQuestion.First.ScrollIntoViewIfNeededAsync();
                         await authorizationQuestion.First.SelectOptionAsync(new SelectOptionValue { Label = answer });
                         filledCount++;
                     }
                     else
                     {
+                        await authorizationQuestion.First.ScrollIntoViewIfNeededAsync();
                         await authorizationQuestion.First.ClickAsync();
                         var answerOptions = page.GetByRole(AriaRole.Option, new() { Name = answer, Exact = true });
                         var visibleAnswerOptions = new List<ILocator>();
@@ -320,19 +397,87 @@ internal static class Program
             }
         }
 
-        if (personalData.RequiresVisaSponsorshipForUsEmployment is bool requiresSponsorship)
+        var sponsorshipAnswer = personalProfile?.AnswerForQuestion(
+            "Will you now or in the future require visa sponsorship for employment in the United States?");
+        if (sponsorshipAnswer is "Yes" or "No")
         {
             filledCount += await FillLabeledBooleanComboboxAsync(
                 page,
                 IsVisaSponsorshipQuestion,
-                requiresSponsorship ? "Yes" : "No",
+                sponsorshipAnswer,
                 "visa sponsorship");
         }
 
-        filledCount += await FillUniqueVisibleFieldAsync(page, "Legal First Name", personalData.LegalFirstName);
-        filledCount += await FillUniqueVisibleFieldAsync(page, "Legal Last Name", personalData.LegalLastName);
-        return filledCount;
+        filledCount += await FillUniqueVisibleFieldAsync(page, "Legal First Name", personalProfile?.LegalFirstName);
+        filledCount += await FillUniqueVisibleFieldAsync(page, "Legal Last Name", personalProfile?.LegalLastName);
+
+        try
+        {
+            var result = await ExternalApplicationFormAssistant.DraftBlankFieldsAsync(
+                page,
+                localModel,
+                jobTitle,
+                resumeText,
+                personalProfile?.Residence,
+                cancellationToken,
+                personalProfile);
+            filledCount += result.FilledCount;
+            return new ApplicationFieldFillResult(filledCount, result.UnansweredQuestions.Count == 0);
+        }
+        catch (HttpRequestException ex)
+        {
+            Console.WriteLine($"Could not contact the local model; leaving the application open for review. ({ex.Message})");
+            return new ApplicationFieldFillResult(filledCount, false);
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"The local model returned an unusable answer; leaving the application open for review. ({ex.Message})");
+            return new ApplicationFieldFillResult(filledCount, false);
+        }
+        catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"The local model request timed out; leaving the application open for review. ({ex.Message})");
+            return new ApplicationFieldFillResult(filledCount, false);
+        }
     }
+
+    private sealed record ApplicationFieldFillResult(int FilledCount, bool AllQuestionsAnswered);
+
+    private static async Task<int> FillResidenceQuestionAsync(IPage page, string? answer)
+    {
+        if (string.IsNullOrWhiteSpace(answer))
+        {
+            return 0;
+        }
+
+        var controls = page.Locator("input:not([type='hidden']):not([type='checkbox']):not([type='radio']), textarea");
+        var matches = new List<ILocator>();
+        for (var index = 0; index < await controls.CountAsync(); index++)
+        {
+            var control = controls.Nth(index);
+            if (!await control.IsVisibleAsync() || await control.IsDisabledAsync() || await control.GetAttributeAsync("readonly") is not null)
+            {
+                continue;
+            }
+
+            if (ResidenceQuestion.IsMatch(await GetAccessibleQuestionLabelAsync(control)))
+            {
+                matches.Add(control);
+            }
+        }
+
+        if (matches.Count != 1)
+        {
+            return 0;
+        }
+
+        await matches[0].ScrollIntoViewIfNeededAsync();
+        await matches[0].FillAsync(answer);
+        Console.WriteLine("Filled the residence question from personal.md.");
+        return 1;
+    }
+
+    private static bool ShouldSkipApplicationUrl(string url) => SkippedApplicationHost.IsMatch(url);
 
     private static async Task<int> FillFullLegalNameQuestionsAsync(IPage page, string fullLegalName)
     {
@@ -371,6 +516,7 @@ internal static class Program
 
             if (labels.Any(ContainsFullLegalNameTerms))
             {
+                await field.ScrollIntoViewIfNeededAsync();
                 await field.FillAsync(fullLegalName);
                 filledCount++;
             }
@@ -391,8 +537,7 @@ internal static class Program
     {
         var normalized = Regex.Replace(label, @"[^\p{L}\p{N}]+", " ").Trim();
         return normalized.Contains("sponsor", StringComparison.OrdinalIgnoreCase)
-            && normalized.Contains("visa", StringComparison.OrdinalIgnoreCase)
-            && normalized.Contains("employment", StringComparison.OrdinalIgnoreCase);
+            && normalized.Contains("visa", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<int> FillLabeledBooleanComboboxAsync(
@@ -436,10 +581,12 @@ internal static class Program
             var tagName = await matches[0].EvaluateAsync<string>("element => element.tagName.toLowerCase()");
             if (tagName == "select")
             {
+                await matches[0].ScrollIntoViewIfNeededAsync();
                 await matches[0].SelectOptionAsync(new SelectOptionValue { Label = answer });
             }
             else
             {
+                await matches[0].ScrollIntoViewIfNeededAsync();
                 await matches[0].ClickAsync();
                 var options = page.GetByRole(AriaRole.Option, new() { Name = answer, Exact = true });
                 var visibleOptions = new List<ILocator>();
@@ -498,6 +645,7 @@ internal static class Program
             return 0;
         }
 
+        await visibleFields[0].ScrollIntoViewIfNeededAsync();
         await visibleFields[0].FillAsync(value);
         return 1;
     }
@@ -517,6 +665,7 @@ internal static class Program
 
         if (questionTextFields.Count == 1)
         {
+            await questionTextFields[0].ScrollIntoViewIfNeededAsync();
             await questionTextFields[0].FillAsync("LinkedIn");
             Console.WriteLine("Answered ‘How did you hear about this job?’ with LinkedIn.");
             return;
@@ -548,6 +697,7 @@ internal static class Program
         {
             try
             {
+                await questionComboBoxes[0].ScrollIntoViewIfNeededAsync();
                 await questionComboBoxes[0].ClickAsync();
                 var linkedinOption = page.GetByRole(AriaRole.Option, new() { Name = "LinkedIn", Exact = true });
                 var visibleOptions = new List<ILocator>();
@@ -582,73 +732,10 @@ internal static class Program
             return;
         }
 
-        var matchingComboBoxes = new List<ILocator>();
-        for (var index = 0; index < await comboBoxes.CountAsync(); index++)
-        {
-            var comboBox = comboBoxes.Nth(index);
-            if (!await comboBox.IsVisibleAsync())
-            {
-                continue;
-            }
-
-            try
-            {
-                await comboBox.ClickAsync();
-                var linkedinOptions = page.GetByRole(AriaRole.Option, new() { Name = "LinkedIn", Exact = true });
-                var visibleLinkedInOption = false;
-                for (var optionIndex = 0; optionIndex < await linkedinOptions.CountAsync(); optionIndex++)
-                {
-                    if (await linkedinOptions.Nth(optionIndex).IsVisibleAsync())
-                    {
-                        visibleLinkedInOption = true;
-                        break;
-                    }
-                }
-
-                if (visibleLinkedInOption)
-                {
-                    matchingComboBoxes.Add(comboBox);
-                }
-                await comboBox.PressAsync("Escape");
-            }
-            catch (PlaywrightException)
-            {
-                // A field may disappear as the form updates; leave it for manual review.
-            }
-        }
-
-        if (matchingComboBoxes.Count != 1)
-        {
-            if (matchingComboBoxes.Count > 1)
-            {
-                Console.WriteLine("More than one dropdown offers LinkedIn; leaving the dropdowns unchanged for manual review.");
-            }
-            return;
-        }
-
-        try
-        {
-            await matchingComboBoxes[0].ClickAsync();
-            var option = page.GetByRole(AriaRole.Option, new() { Name = "LinkedIn", Exact = true });
-            var visibleOptions = new List<ILocator>();
-            for (var index = 0; index < await option.CountAsync(); index++)
-            {
-                if (await option.Nth(index).IsVisibleAsync())
-                {
-                    visibleOptions.Add(option.Nth(index));
-                }
-            }
-
-            if (visibleOptions.Count == 1)
-            {
-                await visibleOptions[0].ClickAsync();
-                Console.WriteLine("Selected LinkedIn in the matching dropdown.");
-            }
-        }
-        catch (PlaywrightException ex)
-        {
-            Console.WriteLine($"Could not select LinkedIn in the dropdown; please review it manually. ({ex.Message})");
-        }
+        // Do not probe every combobox by clicking it. Application forms commonly
+        // contain country/location controls, and their overlays can be blocked by
+        // the sticky modal header. Only select a referral field when its label is
+        // actually recognizable above; otherwise leave the optional field alone.
     }
 
     private static bool IsHowDidYouHearQuestion(string label)
@@ -703,14 +790,7 @@ internal static class Program
             return false;
         }
 
-        Console.WriteLine($"Review the complete application for {jobTitle}.");
-        Console.WriteLine("Type SUBMIT and press Enter to submit this application now, or press Enter to keep it open without submitting.");
-        var approval = await Console.In.ReadLineAsync();
-        if (!string.Equals(approval?.Trim(), "SUBMIT", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
+        Console.WriteLine($"Submitting the completed Greenhouse application for {jobTitle}.");
         await visibleButtons[0].ClickAsync();
         await page.WaitForTimeoutAsync(1500);
         return true;
@@ -871,45 +951,6 @@ internal static class Program
         }
     }
 
-    private static string FindPersonalDataPath()
-    {
-        foreach (var startingPath in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory })
-        {
-            var directory = new DirectoryInfo(Path.GetFullPath(startingPath));
-            while (directory is not null)
-            {
-                var candidate = Path.Combine(directory.FullName, "personal.json");
-                if (File.Exists(candidate))
-                {
-                    return candidate;
-                }
-                directory = directory.Parent;
-            }
-        }
-
-        return Path.Combine(Environment.CurrentDirectory, "personal.json");
-    }
-
-    private static async Task<PersonalData?> LoadPersonalDataAsync(string path)
-    {
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        try
-        {
-            await using var stream = File.OpenRead(path);
-            return await JsonSerializer.DeserializeAsync<PersonalData>(stream,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-        }
-        catch (JsonException ex)
-        {
-            Console.Error.WriteLine($"Could not parse personal settings at {path}: {ex.Message}");
-            return null;
-        }
-    }
-
     private static async Task SaveAppliedJobsAsync(string path, HashSet<string> urls)
     {
         await using var stream = File.Create(path);
@@ -918,10 +959,4 @@ internal static class Program
 
     private sealed record JobListing(string Title, string Url);
 
-    private sealed record PersonalData(
-        string? Email,
-        string? LegalFirstName,
-        string? LegalLastName,
-        bool? AuthorizedToWorkInUs,
-        bool? RequiresVisaSponsorshipForUsEmployment);
 }

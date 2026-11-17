@@ -10,5 +10,6 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Remove="tests/**/*.cs" />
+    <Compile Include="..\Shared\PersonalProfile.cs" Link="PersonalProfile.cs" />
   </ItemGroup>
 </Project>

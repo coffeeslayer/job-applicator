@@ -31,6 +31,8 @@ internal static class Program
     private static readonly Regex DatePattern = new(
         @"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},?\s+\d{4}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex SkippedApplicationUrl = new(@"talenthop|bestjobtool", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex ResidenceQuestion = new(@"city\s*,\s*state\s+and\s+zip[\s\S]*currently residing", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public static async Task<int> Main()
     {
@@ -49,9 +51,13 @@ internal static class Program
         var appliedJobsPath = Path.Combine(dataDirectory, "applied-jobs.json");
         var uncertainJobsPath = Path.Combine(dataDirectory, "uncertain-jobs.json");
         var confirmedAnswersPath = Path.Combine(dataDirectory, "confirmed-answers.json");
+        var questionAnswersPath = Path.Combine(dataDirectory, "question-answers.json");
         var projectRoot = ResumePaths.FindProjectRoot(
             AppContext.BaseDirectory,
             Environment.CurrentDirectory);
+        var personalProfilePath = PersonalProfile.FindPath(projectRoot, Environment.CurrentDirectory);
+        var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
+        var residenceCityStateZip = personalProfile?.Residence;
         var resumeTextPath = ResumePaths.GetResumePath(projectRoot);
         var resumeAnswersPath = Path.Combine(dataDirectory, "resume-answers.json");
         Directory.CreateDirectory(profileDirectory);
@@ -66,13 +72,25 @@ internal static class Program
             $"Applied job IDs are tracked in: {appliedJobsPath} ({appliedJobs.Count} recorded; " +
             $"imported {importedCount} from the previous application history).");
         var confirmedAnswers = await ConfirmedAnswerStore.LoadAsync(confirmedAnswersPath);
+        var questionAnswers = await QuestionAnswerStore.LoadAsync(questionAnswersPath);
+        foreach (var confirmedAnswer in confirmedAnswers.Entries)
+        {
+            if (!questionAnswers.ContainsExactQuestion(confirmedAnswer.Question))
+            {
+                await questionAnswers.AddAndSaveAsync(
+                    questionAnswersPath,
+                    confirmedAnswer.Question,
+                    confirmedAnswer.Answer);
+            }
+        }
+        Console.WriteLine($"Exact question/answer key-value pairs: {questionAnswersPath} ({questionAnswers.Count} saved).");
         var resumeAnswers = await ResumeAnswerStore.LoadAsync(resumeAnswersPath);
         var resumeText = File.Exists(resumeTextPath)
             ? await File.ReadAllTextAsync(resumeTextPath)
             : "";
         if (string.IsNullOrWhiteSpace(resumeText))
         {
-            Console.WriteLine($"Optional project-root resume for excerpt suggestions: {resumeTextPath}");
+            Console.WriteLine($"Optional repository-root resume for excerpt suggestions: {resumeTextPath}");
         }
         Console.WriteLine($"Optional local resume-based answers: {resumeAnswersPath}");
 
@@ -139,8 +157,12 @@ internal static class Program
                     uncertainJobsPath,
                     confirmedAnswers,
                     confirmedAnswersPath,
+                    questionAnswers,
+                    questionAnswersPath,
                     resumeAnswers,
                     resumeText,
+                    residenceCityStateZip,
+                    personalProfile,
                     localModelAvailable ? localModel : null,
                     seenListings,
                     cancellation.Token);
@@ -173,9 +195,15 @@ internal static class Program
             Console.WriteLine("Run cancelled. No further form or listing actions will be taken.");
             return 0;
         }
-        catch (PlaywrightException ex)
+        catch (Exception ex)
         {
-            Console.Error.WriteLine($"Playwright could not complete the run: {ex.Message}");
+            Console.Error.WriteLine("LinkedIn runner failed with an exception:");
+            Console.Error.WriteLine(ex.ToString());
+            if (context is not null)
+            {
+                Console.WriteLine("Chromium and the failed application page are being kept open for troubleshooting. Press Enter after inspecting them to close the browser and exit.");
+                await Console.In.ReadLineAsync();
+            }
             return 1;
         }
         finally
@@ -273,8 +301,12 @@ internal static class Program
         string uncertainJobsPath,
         ConfirmedAnswerStore confirmedAnswers,
         string confirmedAnswersPath,
+        QuestionAnswerStore questionAnswers,
+        string questionAnswersPath,
         ResumeAnswerStore resumeAnswers,
         string resumeText,
+        string? residenceCityStateZip,
+        PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
         HashSet<string> seenThisRun,
         CancellationToken cancellationToken)
@@ -383,6 +415,11 @@ internal static class Program
 
                 if (buttonKind == ApplyButtonKind.ExternalApplyLink)
                 {
+                    if (ShouldSkipApplicationUrl(externalApplyLinks[0].Destination.AbsoluteUri))
+                    {
+                        Console.WriteLine($"  Skipping excluded application URL: {externalApplyLinks[0].Destination}");
+                        continue;
+                    }
                     if (!await OpenExternalApplyAndPauseAsync(
                             page,
                             externalApplyLinks[0].Destination,
@@ -391,6 +428,8 @@ internal static class Program
                             appliedJobs,
                             appliedJobsPath,
                             resumeText,
+                            residenceCityStateZip,
+                            personalProfile,
                             localModel,
                             cancellationToken))
                     {
@@ -424,6 +463,11 @@ internal static class Program
                     var destination = ApplyButtonHandling.ResolveDestination(
                         pageUriBeforeApply,
                         await applyButton.GetAttributeAsync("href"));
+                    if (destination is not null && ShouldSkipApplicationUrl(destination.AbsoluteUri))
+                    {
+                        Console.WriteLine($"  Skipping excluded application URL: {destination}");
+                        continue;
+                    }
                     if (destination is null ||
                         !await OpenExternalApplyAndPauseAsync(
                             page,
@@ -433,6 +477,8 @@ internal static class Program
                             appliedJobs,
                             appliedJobsPath,
                             resumeText,
+                            residenceCityStateZip,
+                            personalProfile,
                             localModel,
                             cancellationToken))
                     {
@@ -458,16 +504,36 @@ internal static class Program
                 if (buttonKind == ApplyButtonKind.Apply &&
                     ApplyButtonHandling.IsExternalDestination(pageUriBeforeApply, page.Url))
                 {
+                    if (ShouldSkipApplicationUrl(page.Url))
+                    {
+                        Console.WriteLine($"  Skipping excluded application URL: {page.Url}");
+                        try
+                        {
+                            await page.GoBackAsync(new PageGoBackOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+                        }
+                        catch (PlaywrightException)
+                        {
+                            Console.WriteLine("  Could not return to LinkedIn after skipping the external URL; stopping this run.");
+                            return;
+                        }
+                        continue;
+                    }
                     Console.WriteLine("  Apply navigated to an external site; stopping without interacting with it.");
                     return;
                 }
 
                 var result = await CompleteEasyApplyAsync(
                     page,
+                    title,
                     confirmedAnswers,
                     confirmedAnswersPath,
+                    questionAnswers,
+                    questionAnswersPath,
                     resumeAnswers,
                     resumeText,
+                    residenceCityStateZip,
+                    personalProfile,
+                    localModel,
                     cancellationToken);
 
                 if (buttonKind == ApplyButtonKind.Apply &&
@@ -524,7 +590,12 @@ internal static class Program
                 .Any(listing => !seenThisRun.Contains(listing.Identity));
             if (!didScroll && !hasUnseenListings)
             {
-                Console.WriteLine("  The left results pane did not move; checking again for newly loaded listings.");
+                if (await AdvanceResultsPageAsync(page, cancellationToken))
+                {
+                    stagnantRounds = 0;
+                    continue;
+                }
+                Console.WriteLine("  The left results pane did not move and no next page advanced; checking again for newly loaded listings.");
             }
             stagnantRounds = didScroll || hasUnseenListings ? 0 : stagnantRounds + 1;
         }
@@ -659,9 +730,12 @@ internal static class Program
         HashSet<string> appliedJobs,
         string appliedJobsPath,
         string resumeText,
+        string? residenceCityStateZip,
+        PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
         CancellationToken cancellationToken)
     {
+        var keepExternalPageForTroubleshooting = false;
         if (!ApplyButtonHandling.IsSafeExternalDestination(destination))
         {
             Console.Error.WriteLine($"  External Apply destination is not HTTPS; refusing to open it: {destination}");
@@ -674,6 +748,11 @@ internal static class Program
             await externalPage.GotoAsync(
                 destination.AbsoluteUri,
                 new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+            if (ShouldSkipApplicationUrl(externalPage.Url))
+            {
+                Console.WriteLine($"  Skipping excluded application URL: {externalPage.Url}");
+                return !sourcePage.IsClosed;
+            }
             if (externalPage.Url.Contains("myworkdayjobs", StringComparison.OrdinalIgnoreCase))
             {
                 Console.WriteLine("  Workday application detected; closing this tab and skipping to the next LinkedIn listing.");
@@ -687,6 +766,8 @@ internal static class Program
                 jobTitle,
                 localModel,
                 resumeText,
+                residenceCityStateZip,
+                personalProfile,
                 cancellationToken);
             if (submitted || ContainsExternalConfirmation(await externalPage.Locator("body").InnerTextAsync()))
             {
@@ -730,14 +811,14 @@ internal static class Program
             Console.WriteLine("  Recorded this job after your manual completion handoff.");
             return true;
         }
-        catch (PlaywrightException ex)
+        catch
         {
-            Console.Error.WriteLine($"  Could not open or wait on the external application page: {ex.Message}");
-            return !sourcePage.IsClosed;
+            keepExternalPageForTroubleshooting = true;
+            throw;
         }
         finally
         {
-            if (!externalPage.IsClosed)
+            if (!keepExternalPageForTroubleshooting && !externalPage.IsClosed)
             {
                 await externalPage.CloseAsync();
             }
@@ -749,6 +830,8 @@ internal static class Program
         string jobTitle,
         LocalModelAnswerClient? localModel,
         string resumeText,
+        string? residenceCityStateZip,
+        PersonalProfile? personalProfile,
         CancellationToken cancellationToken)
     {
         for (var step = 0; step < 12; step++)
@@ -776,7 +859,9 @@ internal static class Program
                     string.IsNullOrWhiteSpace(resumeText) ? null : localModel,
                     jobTitle,
                     resumeText,
-                    cancellationToken);
+                    residenceCityStateZip,
+                    cancellationToken,
+                    personalProfile);
                 if (draftResult.FilledCount > 0)
                 {
                     Console.WriteLine($"  Filled {draftResult.FilledCount} blank field(s) from resume-supported answers.");
@@ -1100,12 +1185,57 @@ internal static class Program
                 .reduce((total, element) => total + element.scrollTop, 0)
             """);
 
+    private static async Task<bool> AdvanceResultsPageAsync(IPage page, CancellationToken cancellationToken)
+    {
+        var nextButtons = await GetVisibleButtonsAsync(
+            page.Locator("button[data-testid='pagination-controls-next-button-visible']"));
+        if (nextButtons.Count != 1 || !await nextButtons[0].IsEnabledAsync())
+        {
+            return false;
+        }
+
+        var previousIdentities = (await ReadVisibleJobListingsAsync(page))
+            .Select(listing => listing.Identity)
+            .ToHashSet(StringComparer.Ordinal);
+        var previousDetailsJobId = JobListingDiscovery.ExtractCurrentJobId(page.Url);
+        Console.WriteLine("  Left pane is at its end; clicking LinkedIn's Next page button.");
+        await nextButtons[0].ClickAsync();
+
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await page.WaitForTimeoutAsync(300);
+            if (page.IsClosed)
+            {
+                return false;
+            }
+
+            var currentJobId = JobListingDiscovery.ExtractCurrentJobId(page.Url);
+            var currentListings = await ReadVisibleJobListingsAsync(page);
+            if ((currentJobId is not null && currentJobId != previousDetailsJobId) ||
+                currentListings.Any(listing => !previousIdentities.Contains(listing.Identity)))
+            {
+                await page.WaitForTimeoutAsync(500);
+                return true;
+            }
+        }
+
+        Console.WriteLine("  Next page was clicked, but LinkedIn did not show different results.");
+        return false;
+    }
+
     private static async Task<ApplyResult> CompleteEasyApplyAsync(
         IPage page,
+        string jobTitle,
         ConfirmedAnswerStore confirmedAnswers,
         string confirmedAnswersPath,
+        QuestionAnswerStore questionAnswers,
+        string questionAnswersPath,
         ResumeAnswerStore resumeAnswers,
         string resumeText,
+        string? residenceCityStateZip,
+        PersonalProfile? personalProfile,
+        LocalModelAnswerClient? localModel,
         CancellationToken cancellationToken)
     {
         var modal = page.Locator("[role='dialog'], .jobs-easy-apply-modal").Last;
@@ -1329,6 +1459,8 @@ internal static class Program
                         browserAnswer,
                         confirmedAnswers,
                         confirmedAnswersPath,
+                        questionAnswers,
+                        questionAnswersPath,
                         resumeAnswers,
                         resumeText))
                 {
@@ -1400,23 +1532,69 @@ internal static class Program
                         }
                         """);
 
-            static async Task<bool> ReviewAndApplyAnswerAsync(
+            async Task<bool> ReviewAndApplyAnswerAsync(
                     PendingAnswerField field,
                     string? browserAnswer,
                     ConfirmedAnswerStore confirmedAnswers,
                     string confirmedAnswersPath,
+                    QuestionAnswerStore questionAnswers,
+                    string questionAnswersPath,
                     ResumeAnswerStore resumeAnswers,
                     string resumeText)
                 {
+                    if (browserAnswer is null && personalProfile?.AnswerForQuestion(field.Question) is { } personalAnswer)
+                    {
+                        if (await ApplyAnswerAsync(field, personalAnswer))
+                        {
+                            Console.WriteLine("Applied the matching answer from local personal.md.");
+                            return true;
+                        }
+
+                        Console.WriteLine($"The personal.md answer for this question did not match exactly one available choice; leaving it for manual review: {field.Question}");
+                    }
+
+                    if (ResidenceQuestion.IsMatch(field.Question) &&
+                        !string.IsNullOrWhiteSpace(residenceCityStateZip) &&
+                        await ApplyAnswerAsync(field, residenceCityStateZip))
+                    {
+                        Console.WriteLine("Applied the configured residence answer for this application only.");
+                        return true;
+                    }
+
                     var sensitive = AnswerMatcher.IsSensitive(field.Question);
                     var previousAnswer = AnswerMatcher.FindPreviousAnswer(field.Question, confirmedAnswers.Entries);
+                    var savedKeyValueSuggestion = browserAnswer is null
+                        ? questionAnswers.FindAnswer(field.Question)
+                        : new AnswerSuggestion(AnswerSuggestionKind.None, null, 0);
                     var suggestion = browserAnswer is not null
                         ? new AnswerSuggestion(AnswerSuggestionKind.None, null, 0)
-                        : previousAnswer.Kind == AnswerSuggestionKind.None
-                            ? resumeAnswers.FindAnswer(field.Question) is { Kind: not AnswerSuggestionKind.None } resumeAnswer
-                                ? resumeAnswer
-                                : AnswerMatcher.FindResumeExcerpt(field.Question, resumeText)
-                            : previousAnswer;
+                        : savedKeyValueSuggestion.Kind != AnswerSuggestionKind.None
+                            ? savedKeyValueSuggestion
+                            : previousAnswer.Kind == AnswerSuggestionKind.None
+                                ? resumeAnswers.FindAnswer(field.Question) is { Kind: not AnswerSuggestionKind.None } resumeAnswer
+                                    ? resumeAnswer
+                                    : AnswerMatcher.FindResumeExcerpt(field.Question, resumeText)
+                                : previousAnswer;
+                    LocalAnswerDraft? localDraft = null;
+                    if (browserAnswer is null && suggestion.Answer is null && localModel is not null &&
+                        (field.Type is "text" or "email" or "tel" or "textarea" or "select" or "radio"))
+                    {
+                        var options = field.Type is "select" or "radio"
+                            ? await GetAvailableOptionsAsync(field)
+                            : [];
+                        localDraft = await localModel.CreateDraftAsync(
+                            field.Question,
+                            field.Type == "radio" ? "select" : field.Type,
+                            jobTitle,
+                            await page.TitleAsync(),
+                            resumeText,
+                            options,
+                            cancellationToken);
+                        if (localDraft is not null)
+                        {
+                            suggestion = new AnswerSuggestion(AnswerSuggestionKind.ResumeAnswer, localDraft.Answer, 1);
+                        }
+                    }
                     if (suggestion.Answer is not null &&
                         !ManualAnswerWindow.ShouldSuggestAnswer(browserAnswer, suggestion.Answer))
                     {
@@ -1436,6 +1614,12 @@ internal static class Program
                             $"Prior confirmed answer ({suggestion.Similarity:P0} Jaccard similarity to: " +
                             $"\"{suggestion.MatchedQuestion}\"): {suggestion.Answer}");
                     }
+                    else if (suggestion.Kind == AnswerSuggestionKind.SavedKeyValueAnswer)
+                    {
+                        Console.WriteLine(
+                            $"Saved key/value answer ({suggestion.Similarity:P0} match to: " +
+                            $"\"{suggestion.MatchedQuestion}\"): {suggestion.Answer}");
+                    }
                     else if (suggestion.Kind == AnswerSuggestionKind.ResumeExcerpt)
                     {
                         Console.WriteLine(
@@ -1445,16 +1629,22 @@ internal static class Program
                     }
                     else if (suggestion.Kind == AnswerSuggestionKind.ResumeAnswer)
                     {
-                        Console.WriteLine("Resume-supported answer:");
+                        Console.WriteLine(localDraft is null
+                            ? "Resume-supported answer:"
+                            : "Local model draft supported by this resume evidence:");
+                        if (localDraft is not null)
+                        {
+                            Console.WriteLine($"  Evidence: {localDraft.Evidence}");
+                        }
                         Console.WriteLine($"  {suggestion.Answer}");
                     }
                     else if (suggestion.Kind == AnswerSuggestionKind.ResumeAnswerUnavailable)
                     {
                         Console.WriteLine("The resume does not provide a supported answer to this question; enter one manually or skip.");
                     }
-                    else if (suggestion.Kind == AnswerSuggestionKind.AmbiguousPreviousAnswers)
+                    else if (suggestion.Kind is AnswerSuggestionKind.AmbiguousQuestionAnswers or AnswerSuggestionKind.AmbiguousPreviousAnswers)
                     {
-                        Console.WriteLine("Several similar prior questions have different confirmed answers:");
+                        Console.WriteLine("Several similar saved questions have different answers:");
                         foreach (var answer in suggestion.ConflictingAnswers ?? [])
                         {
                             Console.WriteLine($"  Q: {answer.Question}");
@@ -1541,9 +1731,7 @@ internal static class Program
                         Console.WriteLine($"Answer to apply: {answer}");
                         Console.WriteLine(preserveBrowserAnswer
                             ? "Confirm keeping this existing answer? [Y] confirm, [S] skip."
-                            : sensitive
-                                ? "Confirm and use this answer for this application only? [Y] confirm, [E] edit, [S] skip."
-                                : "Confirm and save this answer for future matching? [Y] confirm, [E] edit, [S] skip.");
+                            : "Confirm and save this exact question/answer pair locally? [Y] confirm, [E] edit, [S] skip.");
                         var confirmation = Console.ReadLine()?.Trim();
                         if (confirmation is null || confirmation.Equals("S", StringComparison.OrdinalIgnoreCase))
                         {
@@ -1590,14 +1778,11 @@ internal static class Program
                             continue;
                         }
 
+                        await questionAnswers.AddAndSaveAsync(questionAnswersPath, field.Question, answer);
+                        Console.WriteLine($"Saved exact question/answer key-value pair to {questionAnswersPath}.");
                         if (!sensitive)
                         {
                             await confirmedAnswers.AddAndSaveAsync(confirmedAnswersPath, field.Question, answer);
-                            Console.WriteLine("Confirmed answer saved locally.");
-                        }
-                        else
-                        {
-                            Console.WriteLine("Sensitive answer used for this application only; it was not saved.");
                         }
 
                         return true;
@@ -1631,7 +1816,7 @@ internal static class Program
                     if (field.Type == "checkbox")
                     {
                         var isChecked = await control.IsCheckedAsync();
-                        return isChecked ? "Yes" : "No";
+                        return isChecked ? "Yes" : null;
                     }
                     if (field.Type == "select")
                     {
@@ -1706,6 +1891,11 @@ internal static class Program
                     return options;
                 }
 
+            static bool IsAnswerMatch(string answer, string option) =>
+                    answer.Length > 0 &&
+                    (answer == option || option.StartsWith(answer + " ", StringComparison.Ordinal) ||
+                     option.EndsWith(" " + answer, StringComparison.Ordinal));
+
             static async Task<bool> ApplyAnswerAsync(PendingAnswerField field, string answer)
                 {
                     if (field.Type == "radio")
@@ -1716,8 +1906,8 @@ internal static class Program
                         {
                             var label = await ReadControlLabelAsync(control);
                             var value = await control.GetAttributeAsync("value") ?? "";
-                            if (normalizedAnswer == AnswerMatcher.Normalize(label) ||
-                                normalizedAnswer == AnswerMatcher.Normalize(value))
+                            if (IsAnswerMatch(normalizedAnswer, AnswerMatcher.Normalize(label)) ||
+                                IsAnswerMatch(normalizedAnswer, AnswerMatcher.Normalize(value)))
                             {
                                 matches.Add(control);
                             }
@@ -1760,8 +1950,8 @@ internal static class Program
                             var option = options.Nth(index);
                             var label = (await option.InnerTextAsync()).Trim();
                             var value = await option.GetAttributeAsync("value");
-                            if (normalizedAnswer == AnswerMatcher.Normalize(label) ||
-                                normalizedAnswer == AnswerMatcher.Normalize(value ?? ""))
+                            if (IsAnswerMatch(normalizedAnswer, AnswerMatcher.Normalize(label)) ||
+                                IsAnswerMatch(normalizedAnswer, AnswerMatcher.Normalize(value ?? "")))
                             {
                                 matches.Add((value, label));
                             }
@@ -1785,7 +1975,7 @@ internal static class Program
                     if (field.Type == "checkbox")
                     {
                         var normalizedAnswer = AnswerMatcher.Normalize(answer);
-                        var shouldCheck = normalizedAnswer is "yes" or "true";
+                        var shouldCheck = normalizedAnswer is "yes" or "true" or "agree";
                         if (!shouldCheck && normalizedAnswer is not ("no" or "false"))
                         {
                             return false;
@@ -1823,7 +2013,20 @@ internal static class Program
                         return false;
                     }
 
-                    await field.Controls[0].FillAsync(answer);
+                    var textField = field.Controls[0];
+                    if (string.Equals(await textField.GetAttributeAsync("type"), "number", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var numericAnswer = Regex.Replace(answer, @"[^\d.\-]", "");
+                        if (numericAnswer.Length == 0)
+                        {
+                            return false;
+                        }
+                        await textField.FillAsync(numericAnswer);
+                    }
+                    else
+                    {
+                        await textField.FillAsync(answer);
+                    }
                     return true;
                 }
 
@@ -2114,6 +2317,8 @@ internal static class Program
 
         return ids;
     }
+
+    private static bool ShouldSkipApplicationUrl(string url) => SkippedApplicationUrl.IsMatch(url);
 
     private static async Task SaveListingIdsAsync(string path, HashSet<string> appliedJobs)
     {
