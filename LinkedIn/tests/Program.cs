@@ -1,3 +1,6 @@
+using System.Net;
+using System.Text.Json;
+
 static class AnswerMatcherTests
 {
     public static async Task<int> Main()
@@ -16,6 +19,9 @@ static class AnswerMatcherTests
             ("does not suggest answers for unsupported or sensitive questions", LeavesUnsupportedResumeAnswersBlank),
             ("suggests answers only when the field is blank", SuggestsAnswersOnlyForBlankFields),
             ("resolves resume.md at the project root", ResolvesProjectRootResumePath),
+            ("keeps the scan session available until explicit exit", HandlesPostScanActions),
+            ("discovers listings from card attributes and job links", DiscoversJobListings),
+            ("separates result cards from the selected details job ID", DistinguishesResultCardsFromDetails),
             ("starts a fresh mouse-idle window and preserves browser answers", DetectsMouseIdleWaitAndManualAnswers),
             ("selects an external Apply link before the no-Easy-Apply skip path", SelectsSupportedApplyButton),
             ("recognizes accessible external Apply links and unwraps LinkedIn redirects", DetectsExternalApplyLinks),
@@ -33,6 +39,14 @@ static class AnswerMatcherTests
         Console.WriteLine("PASS persists confirmed answer records");
         await LoadsConfiguredResumeAnswers();
         Console.WriteLine("PASS loads only supported local resume-answer keys");
+        LocalModelConfigurationIsLoopbackOnly();
+        Console.WriteLine("PASS restricts local model endpoints to loopback");
+        await DraftsRequireVerbatimResumeEvidence();
+        Console.WriteLine("PASS local drafts require verbatim resume evidence and matching choices");
+        await DraftsContactDetailsOnlyFromExactResumeText();
+        Console.WriteLine("PASS contact details must occur verbatim in the resume");
+        await LeavesHighImpactFieldsManual();
+        Console.WriteLine("PASS local model is not queried for high-impact questions");
         return 0;
     }
 
@@ -204,6 +218,205 @@ static class AnswerMatcherTests
         finally
         {
             Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static void HandlesPostScanActions()
+    {
+        Equal(ScanCompletionAction.Rescan, ScanCompletion.ParseAction(""));
+        Equal(ScanCompletionAction.Rescan, ScanCompletion.ParseAction("   "));
+        Equal(ScanCompletionAction.Exit, ScanCompletion.ParseAction("q"));
+        Equal(ScanCompletionAction.Exit, ScanCompletion.ParseAction(" Q "));
+        Equal(ScanCompletionAction.Invalid, ScanCompletion.ParseAction("x"));
+        Equal(ScanCompletionAction.Exit, ScanCompletion.ParseAction(null));
+    }
+
+    private static void DiscoversJobListings()
+    {
+        Equal(
+            "4489288400",
+            JobListingDiscovery.ExtractJobId("4489288400", null, []));
+        Equal(
+            "1234567890",
+            JobListingDiscovery.ExtractJobId(null, "1234567890", []));
+        Equal(
+            "9876543210",
+            JobListingDiscovery.ExtractJobId(
+                null,
+                null,
+                ["/jobs/view/9876543210/?trackingId=example"]));
+        Equal<string?>(
+            null,
+            JobListingDiscovery.ExtractJobId(null, null, ["/jobs/view/not-a-job"]));
+    }
+
+    private static void DistinguishesResultCardsFromDetails()
+    {
+        Equal(
+            "4489288400",
+            JobListingDiscovery.ExtractCurrentJobId(
+                "https://www.linkedin.com/jobs/search-results/?currentJobId=4489288400"));
+        Equal<string?>(
+            null,
+            JobListingDiscovery.ExtractCurrentJobId(
+                "https://www.linkedin.com/jobs/search-results/?keywords=software"));
+        Equal(
+            true,
+            JobListingDiscovery.IsLeftPaneCandidate(20, 100, 430, 180, 1400, 900, "Senior Software Engineer"));
+        Equal(
+            false,
+            JobListingDiscovery.IsLeftPaneCandidate(800, 100, 500, 300, 1400, 900, "Senior Software Engineer"));
+        Equal(
+            JobListingDiscovery.CreateIdentity(null, "Senior Software Engineer"),
+            JobListingDiscovery.CreateIdentity(null, "  Senior   Software Engineer "));
+    }
+
+    private static void LocalModelConfigurationIsLoopbackOnly()
+    {
+        var config = LocalModelConfiguration.Parse("http://127.0.0.1:1234/v1", "local-model");
+        Equal(new Uri("http://127.0.0.1:1234/v1/models"), config.GetModelsUri());
+        Equal(new Uri("http://127.0.0.1:1234/v1/chat/completions"), config.GetChatCompletionsUri());
+
+        foreach (var endpoint in new[]
+                 {
+                     "https://api.example.com/v1",
+                     "http://192.0.2.1:1234/v1",
+                     "http://127.0.0.1:1234/v1?redirect=https://example.com"
+                 })
+        {
+            try
+            {
+                LocalModelConfiguration.Parse(endpoint, "model");
+                throw new InvalidOperationException($"Expected non-local endpoint to be rejected: {endpoint}");
+            }
+            catch (InvalidDataException)
+            {
+            }
+        }
+    }
+
+    private static async Task DraftsRequireVerbatimResumeEvidence()
+    {
+        const string resume = "Developed C# software for production systems.";
+        var handler = new StubHttpMessageHandler(
+            ModelResponse("""{"answer":"C# and .NET","evidence":"Developed C# software for production systems.","reason":"The resume states this experience."}"""),
+            ModelResponse("""{"answer":"10 years","evidence":"I have 10 years of experience.","reason":"Estimated from the resume."}"""));
+        using var httpClient = new HttpClient(handler);
+        using var model = new LocalModelAnswerClient(
+            LocalModelConfiguration.Parse("http://127.0.0.1:1234/v1", "test-model"),
+            httpClient);
+
+        var draft = await model.CreateDraftAsync(
+            "Describe your C# experience",
+            "text",
+            "Software Engineer",
+            "Application",
+            resume,
+            [],
+            CancellationToken.None);
+        Equal("C# and .NET", draft?.Answer);
+        Equal(resume, draft?.Evidence);
+        Equal(new Uri("http://127.0.0.1:1234/v1/chat/completions"), handler.RequestUris[0]);
+
+        var unsupported = await model.CreateDraftAsync(
+            "How many years of experience do you have?",
+            "text",
+            "Software Engineer",
+            "Application",
+            resume,
+            [],
+            CancellationToken.None);
+        Equal<LocalAnswerDraft?>(null, unsupported);
+        Equal(2, handler.RequestUris.Count);
+    }
+
+    private static async Task LeavesHighImpactFieldsManual()
+    {
+        var handler = new StubHttpMessageHandler();
+        using var httpClient = new HttpClient(handler);
+        using var model = new LocalModelAnswerClient(
+            LocalModelConfiguration.Parse("http://127.0.0.1:1234/v1", "test-model"),
+            httpClient);
+        var draft = await model.CreateDraftAsync(
+            "Will you now or in the future require visa sponsorship?",
+            "text",
+            "Software Engineer",
+            "Application",
+            "The resume says nothing about work authorization.",
+            [],
+            CancellationToken.None);
+        Equal<LocalAnswerDraft?>(null, draft);
+        Equal(0, handler.RequestUris.Count);
+        Equal(true, LocalModelAnswerClient.IsHighImpactQuestion("visaSponsorship"));
+        Equal(true, LocalModelAnswerClient.IsHighImpactQuestion("work_authorization"));
+    }
+
+    private static async Task DraftsContactDetailsOnlyFromExactResumeText()
+    {
+        const string resume = "Email: user@example.com\nLocation: United States";
+        var handler = new StubHttpMessageHandler(
+            ModelResponse("""{"answer":"user@example.com","evidence":"Email: user@example.com","reason":"Copied from the resume."}"""),
+            ModelResponse("""{"answer":"other@example.com","evidence":"Email: user@example.com","reason":"Guessed contact detail."}"""),
+            ModelResponse("""{"answer":"USA","evidence":"Location: United States","reason":"Abbreviated country."}"""));
+        using var httpClient = new HttpClient(handler);
+        using var model = new LocalModelAnswerClient(
+            LocalModelConfiguration.Parse("http://127.0.0.1:1234/v1", "test-model"),
+            httpClient);
+
+        var email = await model.CreateDraftAsync(
+            "Email address",
+            "email",
+            "Software Engineer",
+            "Application",
+            resume,
+            [],
+            CancellationToken.None);
+        Equal("user@example.com", email?.Answer);
+
+        var guessedEmail = await model.CreateDraftAsync(
+            "Email address",
+            "email",
+            "Software Engineer",
+            "Application",
+            resume,
+            [],
+            CancellationToken.None);
+        Equal<LocalAnswerDraft?>(null, guessedEmail);
+
+        var invalidChoice = await model.CreateDraftAsync(
+            "Country",
+            "select",
+            "Software Engineer",
+            "Application",
+            resume,
+            ["United States", "Canada"],
+            CancellationToken.None);
+        Equal<LocalAnswerDraft?>(null, invalidChoice);
+    }
+
+    private static HttpResponseMessage ModelResponse(string content) =>
+        new(HttpStatusCode.OK)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new
+            {
+                choices = new[]
+                {
+                    new { message = new { content } }
+                }
+            }))
+        };
+
+    private sealed class StubHttpMessageHandler(params HttpResponseMessage[] responses) : HttpMessageHandler
+    {
+        private readonly Queue<HttpResponseMessage> responses = new(responses);
+        public List<Uri?> RequestUris { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestUris.Add(request.RequestUri);
+            return Task.FromResult(responses.Dequeue());
         }
     }
 

@@ -4,7 +4,7 @@ A local job-search dashboard with an optional Playwright runner for Dice Easy Ap
 
 The default search matches:
 
-- Keywords: `.net developer with react`
+- Keywords: `.net ai react architect`
 - Posted: past 3 days
 - Workplace: remote
 - Easy Apply: enabled
@@ -43,7 +43,6 @@ The runner prints progress while opening Chrome and loading the search. It click
 
 The dedicated Chrome profile is stored under your Windows local app data, outside this project. The application history is stored in `.dice-application-state.json` and excluded from Git.
 
-## LinkedIn Easy Apply runner
 
 The LinkedIn runner uses the search URL you provided (`.net react remote`, Pensacola Metropolitan Area, past 7 days). It opens a separate Chrome profile at `%LOCALAPPDATA%\LinkedInJobSearch\ChromeProfile` and keeps the session for future runs. It can sign in using `LINKEDIN_EMAIL` and `LINKEDIN_PASSWORD` in the local, Git-ignored `.env` file, or you can sign in manually in Chrome. If LinkedIn requests verification, complete it in the browser. The email value must be the email address, phone number, or username accepted by LinkedIn.
 
