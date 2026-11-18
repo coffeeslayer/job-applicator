@@ -39,7 +39,8 @@ public sealed record PersonalProfile(
     string? ActiveDuty = null,
     string? PreviouslyEmployedAtBox = null,
     string? WillingToRelocate = null,
-    string? ResidesInUnitedStates = null)
+    string? ResidesInUnitedStates = null,
+    IReadOnlyDictionary<string, string>? AdditionalEntries = null)
 {
     private static readonly Regex EntryPattern = new(
         @"(?im)^\s*[-*]?\s*(?<key>[\p{L}][\p{L}\p{N} /_-]*?)\s*:\s*(?<value>.+?)\s*$",
@@ -123,7 +124,8 @@ public sealed record PersonalProfile(
             Read("Currently active member of the U.S. Armed Forces", "Active duty"),
             Read("Previously employed at Box", "Worked at Box"),
             Read("Willing to relocate or commute to a designated office three days per week", "Willing to relocate"),
-            Read("Currently resides in the United States", "Resides in the United States"));
+            Read("Currently resides in the United States", "Resides in the United States"),
+            values);
     }
 
     public string? AnswerForQuestion(string question)
@@ -134,6 +136,24 @@ public sealed record PersonalProfile(
         }
 
         var normalized = Regex.Replace(question, @"[^\p{L}\p{N}]+", " ").Trim();
+
+        if (AdditionalEntries is not null)
+        {
+            if (AdditionalEntries.TryGetValue(normalized, out var exact))
+            {
+                return exact;
+            }
+
+            foreach (var (key, value) in AdditionalEntries)
+            {
+                if (key.Length >= 6 &&
+                    (normalized.Contains(key, StringComparison.OrdinalIgnoreCase) ||
+                     key.Contains(normalized, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return value;
+                }
+            }
+        }
         if (normalized.Contains("address line 1", StringComparison.OrdinalIgnoreCase) ||
             normalized.Contains("street address", StringComparison.OrdinalIgnoreCase))
         {
@@ -183,21 +203,51 @@ public sealed record PersonalProfile(
         {
             return LinkedInUrl;
         }
-        if ((normalized.Contains("employed at box", StringComparison.OrdinalIgnoreCase) ||
-             normalized.Contains("worked at box", StringComparison.OrdinalIgnoreCase) ||
-             normalized.Contains("work for box", StringComparison.OrdinalIgnoreCase)) &&
-            normalized.Contains("ever", StringComparison.OrdinalIgnoreCase))
+        if ((normalized.Contains("employed at", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("worked at", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("work for", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("worked for", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("prior employee", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("former employee", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("previous employee", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("previously employed", StringComparison.OrdinalIgnoreCase)) &&
+            (normalized.Contains("ever", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("previously", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("prior", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("past", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("full time employee", StringComparison.OrdinalIgnoreCase)))
         {
-            return PreviouslyEmployedAtBox;
+            if (normalized.Contains("box", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(PreviouslyEmployedAtBox))
+            {
+                return PreviouslyEmployedAtBox;
+            }
+            return AdditionalEntries?.GetValueOrDefault("default answer for prior employer questions") ?? "No";
         }
         if (normalized.Contains("relocate", StringComparison.OrdinalIgnoreCase) ||
-            normalized.Contains("commute to this position", StringComparison.OrdinalIgnoreCase))
+            normalized.Contains("commute", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("in office", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("days in office", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("onsite", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("on site", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("headquarters", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("hybrid", StringComparison.OrdinalIgnoreCase))
         {
-            return WillingToRelocate;
+            return WillingToRelocate ?? "No";
         }
-        if (normalized.Contains("currently reside in the united states", StringComparison.OrdinalIgnoreCase))
+        if (normalized.Contains("local to", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("bay area", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("san francisco", StringComparison.OrdinalIgnoreCase))
         {
-            return ResidesInUnitedStates;
+            return AdditionalEntries?.GetValueOrDefault("local to the san francisco bay area") ?? "No";
+        }
+        if (normalized.Contains("currently reside in the united states", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("located in the united states", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("living in the united states", StringComparison.OrdinalIgnoreCase) ||
+            (normalized.Contains("in the united states", StringComparison.OrdinalIgnoreCase) &&
+             (normalized.Contains("located", StringComparison.OrdinalIgnoreCase) ||
+              normalized.Contains("currently", StringComparison.OrdinalIgnoreCase))))
+        {
+            return ResidesInUnitedStates ?? "Yes";
         }
         if (normalized.Contains("consent to process", StringComparison.OrdinalIgnoreCase))
         {
@@ -214,10 +264,20 @@ public sealed record PersonalProfile(
         {
             return EmploymentRestrictions;
         }
-        if (normalized.Contains("related to anyone", StringComparison.OrdinalIgnoreCase) ||
-            normalized.Contains("related to a current", StringComparison.OrdinalIgnoreCase))
+        if (normalized.Contains("relative", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("familial", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("family member", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("related to anyone", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("related to a current", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("related to an employee", StringComparison.OrdinalIgnoreCase))
         {
-            return RelatedToEmployee;
+            return RelatedToEmployee ?? AdditionalEntries?.GetValueOrDefault("default answer for employee relatives") ?? "No";
+        }
+        if (normalized.Contains("if yes", StringComparison.OrdinalIgnoreCase) &&
+            (normalized.Contains("name", StringComparison.OrdinalIgnoreCase) ||
+             normalized.Contains("relationship", StringComparison.OrdinalIgnoreCase)))
+        {
+            return AdditionalEntries?.GetValueOrDefault("name and relationship of relatives at company") ?? "None";
         }
         if (normalized.Contains("referred by a current", StringComparison.OrdinalIgnoreCase) ||
             normalized.Contains("employee referral", StringComparison.OrdinalIgnoreCase))
@@ -322,9 +382,10 @@ public sealed record PersonalProfile(
             return Citizenship;
         }
         if (normalized.Contains("about us", StringComparison.OrdinalIgnoreCase) ||
-            normalized.Contains("how did you hear", StringComparison.OrdinalIgnoreCase))
+            normalized.Contains("how did you hear", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Contains("referral source", StringComparison.OrdinalIgnoreCase))
         {
-            return ReferralSource;
+            return ReferralSource ?? "LinkedIn";
         }
         if (normalized.Contains("city", StringComparison.OrdinalIgnoreCase) ||
             normalized.Contains("state", StringComparison.OrdinalIgnoreCase) ||

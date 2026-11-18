@@ -28,8 +28,10 @@ internal static class Program
         var profileDirectory = Path.Combine(dataDirectory, "PlaywrightProfile");
         var appliedJobsPath = Path.Combine(dataDirectory, "applied-jobs.json");
         var personalProfilePath = PersonalProfile.FindPath(Environment.CurrentDirectory, AppContext.BaseDirectory);
-        var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
         var projectRoot = Path.GetDirectoryName(personalProfilePath)!;
+        var teeWriter = new ConsoleTeeWriter(Console.Out, Path.Combine(projectRoot, "console.log"));
+        Console.SetOut(teeWriter);
+        var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
         var resumePath = Path.Combine(projectRoot, "resume.md");
         var resumeText = File.Exists(resumePath) ? await File.ReadAllTextAsync(resumePath) : "";
         LocalModelAnswerClient? localModel = null;
@@ -98,11 +100,6 @@ internal static class Program
             var seenThisRun = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             while (!cancellation.IsCancellationRequested && !searchPage.IsClosed)
             {
-                if (await HasSubmissionConfirmationAsync(searchPage))
-                {
-                    await DismissApplicationSuccessAndRestoreSearchAsync(searchPage, searchPage);
-                }
-
                 var listings = await ReadListingsAsync(searchPage);
                 if (listings.Count == 0)
                 {
@@ -178,13 +175,36 @@ internal static class Program
                                 await OfferApplicationSubmissionAsync(applicationPage, listing.Title);
                             if (!fillResult.AllQuestionsAnswered)
                             {
-                                Console.WriteLine("Some questions were not supported by personal.md or resume.md. Leaving the form for manual review instead of submitting.");
+                                Console.WriteLine();
+                                Console.WriteLine("===============================================================");
+                                Console.WriteLine($"[ACTION REQUIRED] UNANSWERED QUESTIONS FOR: {listing.Title}");
+                                foreach (var q in fillResult.UnansweredQuestions)
+                                {
+                                    Console.WriteLine($"  * {q}");
+                                }
+                                Console.WriteLine("Tell the assistant in chat: 'check console' to answer these in personal.md!");
+                                Console.WriteLine("===============================================================");
+                                Console.WriteLine();
+
+                                var pendingPath = Path.Combine(projectRoot, "pending-questions.json");
+                                await File.WriteAllTextAsync(pendingPath, JsonSerializer.Serialize(new
+                                {
+                                    jobTitle = listing.Title,
+                                    jobUrl = listing.Url,
+                                    timestamp = DateTimeOffset.UtcNow,
+                                    unansweredQuestions = fillResult.UnansweredQuestions
+                                }, JsonOptions));
                             }
                             if (submitted && await HasSubmissionConfirmationAsync(applicationPage))
                             {
                                 appliedJobs.Add(listing.Url);
                                 await SaveAppliedJobsAsync(appliedJobsPath, appliedJobs);
                                 Console.WriteLine("Greenhouse confirmed the application. Recorded as applied.");
+                                var pendingPath = Path.Combine(projectRoot, "pending-questions.json");
+                                if (File.Exists(pendingPath))
+                                {
+                                    File.Delete(pendingPath);
+                                }
                                 await DismissApplicationSuccessAndRestoreSearchAsync(applicationPage, searchPage);
                                 continue;
                             }
@@ -391,26 +411,26 @@ internal static class Program
                 cancellationToken,
                 personalProfile);
             filledCount += result.FilledCount;
-            return new ApplicationFieldFillResult(filledCount, result.UnansweredQuestions.Count == 0);
+            return new ApplicationFieldFillResult(filledCount, result.UnansweredQuestions.Count == 0, result.UnansweredQuestions);
         }
         catch (HttpRequestException ex)
         {
             Console.WriteLine($"Could not contact the local model; leaving the application open for review. ({ex.Message})");
-            return new ApplicationFieldFillResult(filledCount, false);
+            return new ApplicationFieldFillResult(filledCount, false, []);
         }
         catch (JsonException ex)
         {
             Console.WriteLine($"The local model returned an unusable answer; leaving the application open for review. ({ex.Message})");
-            return new ApplicationFieldFillResult(filledCount, false);
+            return new ApplicationFieldFillResult(filledCount, false, []);
         }
         catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
         {
             Console.WriteLine($"The local model request timed out; leaving the application open for review. ({ex.Message})");
-            return new ApplicationFieldFillResult(filledCount, false);
+            return new ApplicationFieldFillResult(filledCount, false, []);
         }
     }
 
-    private sealed record ApplicationFieldFillResult(int FilledCount, bool AllQuestionsAnswered);
+    private sealed record ApplicationFieldFillResult(int FilledCount, bool AllQuestionsAnswered, IReadOnlyList<string> UnansweredQuestions);
 
     private static async Task<int> FillResidenceQuestionAsync(IPage page, string? answer)
     {
@@ -600,7 +620,8 @@ internal static class Program
 
                     if (visibleOptions.Count != 1)
                     {
-                        await match.PressAsync("Escape");
+                        // Toggle closed safely without pressing Escape which closes the application modal
+                        await match.ClickAsync(new LocatorClickOptions { Force = true });
                         Console.WriteLine($"Could not identify a unique {answer} option for {description}; please answer it manually.");
                         continue;
                     }
@@ -736,7 +757,7 @@ internal static class Program
                 }
                 else
                 {
-                    await questionComboBoxes[0].PressAsync("Escape");
+                    await questionComboBoxes[0].ClickAsync(new LocatorClickOptions { Force = true });
                     Console.WriteLine("The matching question did not offer a unique LinkedIn option; please answer it manually.");
                 }
             }
@@ -761,7 +782,8 @@ internal static class Program
     private static bool IsHowDidYouHearQuestion(string label)
     {
         var normalized = Regex.Replace(label, @"[^\p{L}\p{N}]+", " ").Trim();
-        return normalized.Equals("How did you hear about this job", StringComparison.OrdinalIgnoreCase);
+        return normalized.Contains("how did you hear", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Contains("referral source", StringComparison.OrdinalIgnoreCase);
     }
 
     private static Task<string> GetAccessibleQuestionLabelAsync(ILocator element) =>
@@ -849,10 +871,12 @@ internal static class Program
             return false;
         }
 
-        var bodyText = await page.Locator("body").InnerTextAsync();
+        var confirmation = page.Locator("[role='dialog'], .modal, .confirmation, [class*='success'], [class*='submitted']");
+        var target = await confirmation.CountAsync() > 0 ? confirmation.First : page.Locator("body");
+        var text = await target.InnerTextAsync();
         return Regex.IsMatch(
-            bodyText,
-            @"application (?:has been|was) submitted|thank you for applying|application received|successfully submitted",
+            text,
+            @"(?:your\s+)?application (?:has been|was) submitted|thank you for applying|successfully submitted",
             RegexOptions.IgnoreCase);
     }
 
@@ -860,11 +884,12 @@ internal static class Program
     {
         if (!successPage.IsClosed)
         {
-            // Greenhouse presents the confirmation in a modal. Clicking outside it
-            // dismisses the modal; reloading the explicit URL restores the filters
-            // even if that dismissal navigates back to the default jobs page.
-            await successPage.Mouse.ClickAsync(5, 5);
-            await successPage.WaitForTimeoutAsync(300);
+            var closeButtons = successPage.Locator("[role='dialog'] button[aria-label*='close' i], [role='dialog'] button:has-text('Done'), [role='dialog'] button:has-text('Close'), [role='dialog'] button:has-text('Dismiss')");
+            if (await closeButtons.CountAsync() > 0 && await closeButtons.First.IsVisibleAsync())
+            {
+                await closeButtons.First.ClickAsync();
+                await successPage.WaitForTimeoutAsync(300);
+            }
         }
 
         if (!searchPage.IsClosed)
@@ -1005,4 +1030,47 @@ internal static class Program
 
     private sealed record JobListing(string Title, string Url);
 
+    private sealed class ConsoleTeeWriter : TextWriter
+    {
+        private readonly TextWriter consoleOut;
+        private readonly StreamWriter fileOut;
+
+        public ConsoleTeeWriter(TextWriter consoleOut, string filePath)
+        {
+            this.consoleOut = consoleOut;
+            this.fileOut = new StreamWriter(new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+            {
+                AutoFlush = true
+            };
+        }
+
+        public override System.Text.Encoding Encoding => consoleOut.Encoding;
+
+        public override void Write(char value)
+        {
+            consoleOut.Write(value);
+            fileOut.Write(value);
+        }
+
+        public override void Write(string? value)
+        {
+            consoleOut.Write(value);
+            fileOut.Write(value);
+        }
+
+        public override void WriteLine(string? value)
+        {
+            consoleOut.WriteLine(value);
+            fileOut.WriteLine(value);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                fileOut.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
 }

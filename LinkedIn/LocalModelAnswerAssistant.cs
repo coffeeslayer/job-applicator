@@ -716,7 +716,7 @@ public static class ExternalApplicationFormAssistant
                     }
                     else
                     {
-                        await field.PressAsync("Escape");
+                        await field.ClickAsync(new LocatorClickOptions { Force = true });
                         Console.WriteLine($"  Could not select a unique option for \"{question}\" from the available choices: {string.Join(" | ", availableOptions)}");
                         await field.FillAsync("");
                     }
@@ -872,7 +872,12 @@ public static class ResumeUploadAssistant
                     for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
                         const text = (node.innerText || node.textContent || '').trim();
                         if (text && text.length < 600) pieces.push(text);
-                        if (node.matches('fieldset, [role="group"], [class*="form-field"], [class*="form-group"], [class*="upload"], [class*="dropzone"]')) break;
+                        if (node.matches('fieldset, [role="group"], [class*="form-field"], [class*="form-group"]')) break;
+                    }
+                    const container = element.closest('fieldset, [role="group"], [class*="form-field"], [class*="field"], .field');
+                    if (container) {
+                        const text = (container.innerText || container.textContent || '').trim();
+                        if (text && text.length < 600) pieces.push(text);
                     }
                     return pieces.filter(Boolean).join(' | ');
                 }
@@ -885,8 +890,9 @@ public static class ResumeUploadAssistant
         {
             var description = candidate.Description;
             var explicitlyResume = ResumeLabel.IsMatch(description);
+            var isOtherDocument = OtherDocumentLabel.IsMatch(description) || description.Contains("cover letter", StringComparison.OrdinalIgnoreCase);
             var genericSingleUpload = descriptions.Count == 1 && UploadLabel.IsMatch(description);
-            if (OtherDocumentLabel.IsMatch(description) || (!explicitlyResume && !genericSingleUpload))
+            if (isOtherDocument || (!explicitlyResume && !genericSingleUpload))
             {
                 continue;
             }
