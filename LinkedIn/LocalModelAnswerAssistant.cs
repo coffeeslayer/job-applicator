@@ -286,6 +286,7 @@ public static class ExternalApplicationFormAssistant
         var draftedCount = personalProfile is null
             ? 0
             : await FillPersonalProfileFieldsAsync(page, formRoot, personalProfile, cancellationToken);
+        draftedCount += await ResumeUploadAssistant.UploadResumeAsync(formRoot, cancellationToken);
         var unansweredQuestions = new List<string>();
 
         var choiceFields = formRoot.Locator("input[type='radio'], input[type='checkbox'], input[type='file']");
@@ -834,6 +835,94 @@ public static class ExternalApplicationFormAssistant
     }
 
     private readonly record struct SelectOptionValue(string Value);
+}
+
+public static class ResumeUploadAssistant
+{
+    private static readonly Regex ResumeLabel = new(@"\b(resume|curriculum vitae|cv)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex OtherDocumentLabel = new(@"\b(cover letter|portfolio|transcript|writing sample|work sample)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex UploadLabel = new(@"\b(upload|attach|browse|choose file|select file)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public static async Task<int> UploadResumeAsync(ILocator formRoot, CancellationToken cancellationToken)
+    {
+        var resumePath = FindResumePdfPath();
+        if (resumePath is null)
+        {
+            return 0;
+        }
+
+        var fileInputs = formRoot.Locator("input[type='file']");
+        var count = await fileInputs.CountAsync();
+        var descriptions = new List<(ILocator Input, string Description)>();
+        for (var index = 0; index < count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var input = fileInputs.Nth(index);
+            if (await input.IsDisabledAsync())
+            {
+                continue;
+            }
+
+            var description = await input.EvaluateAsync<string>(
+                """
+                element => {
+                    const labels = Array.from(element.labels || []).map(label => label.innerText || label.textContent || '').join(' ');
+                    const pieces = [labels, element.getAttribute('aria-label') || '', element.getAttribute('name') || '', element.getAttribute('accept') || ''];
+                    let node = element.parentElement;
+                    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+                        const text = (node.innerText || node.textContent || '').trim();
+                        if (text && text.length < 600) pieces.push(text);
+                        if (node.matches('fieldset, [role="group"], [class*="form-field"], [class*="form-group"], [class*="upload"], [class*="dropzone"]')) break;
+                    }
+                    return pieces.filter(Boolean).join(' | ');
+                }
+                """);
+            descriptions.Add((input, description));
+        }
+
+        var uploaded = 0;
+        foreach (var candidate in descriptions)
+        {
+            var description = candidate.Description;
+            var explicitlyResume = ResumeLabel.IsMatch(description);
+            var genericSingleUpload = descriptions.Count == 1 && UploadLabel.IsMatch(description);
+            if (OtherDocumentLabel.IsMatch(description) || (!explicitlyResume && !genericSingleUpload))
+            {
+                continue;
+            }
+
+            var existingFiles = await candidate.Input.EvaluateAsync<int>("element => element.files?.length || 0");
+            if (existingFiles > 0)
+            {
+                continue;
+            }
+
+            await candidate.Input.SetInputFilesAsync(resumePath);
+            uploaded++;
+            Console.WriteLine($"  Uploaded Resume.pdf to the resume/file upload field ({description.Split('|')[0].Trim()}).");
+        }
+
+        return uploaded;
+    }
+
+    public static string? FindResumePdfPath()
+    {
+        foreach (var start in new[] { Environment.CurrentDirectory, AppContext.BaseDirectory })
+        {
+            var directory = new DirectoryInfo(Path.GetFullPath(start));
+            while (directory is not null)
+            {
+                var candidate = Path.Combine(directory.FullName, "Resume.pdf");
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+                directory = directory.Parent;
+            }
+        }
+
+        return null;
+    }
 }
 
 public sealed record ExternalDraftResult(int FilledCount, IReadOnlyList<string> UnansweredQuestions);

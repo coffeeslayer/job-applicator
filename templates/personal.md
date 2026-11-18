@@ -1,0 +1,45 @@
+# Personal application answers template
+
+Copy this file to the repository root as `personal.md`, then fill in only the answers you want reused. Leave unknown or unwanted answers blank. Do not put passwords, one-time codes, or payment details here.
+
+- Residence:
+- Address Line 1:
+- Postal Code:
+- Country:
+- Phone:
+- Email:
+- Legal first name:
+- Legal last name:
+- Preferred first name:
+- Resume file:
+- Current employer:
+- Current job title:
+- School:
+- Degree:
+- Professional certifications:
+- Requires sponsorship:
+- US citizenship:
+- Legally authorized to work in the United States:
+- Referral source:
+- Referred by a current employee:
+- Employee referral full name:
+- LinkedIn profile URL:
+- Personal website:
+- E-learning or ed-tech work experience:
+- Previously worked for Renaissance Learning or an acquired company:
+- K-12 education/data experience:
+- Salary expectations:
+- Non-compete or other employment restriction:
+- Race/ethnicity:
+- Hispanic/Latino status:
+- Gender:
+- Pronouns:
+- Sexual orientation:
+- Transgender identity:
+- Disability or chronic condition:
+- Disability status:
+- Veteran status:
+- Currently active member of the U.S. Armed Forces:
+- Default answer for unanswered voluntary EEO questions:
+- Privacy consent:
+- AI integrity agreement:

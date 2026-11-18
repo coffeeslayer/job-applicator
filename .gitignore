@@ -6,3 +6,8 @@ resume.md
 __pycache__/
 bin/
 obj/
+Resume.pdf
+!templates/
+!templates/personal.md
+!templates/resume.md
+!templates/Resume.pdf

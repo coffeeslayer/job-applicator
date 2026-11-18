@@ -33,6 +33,10 @@ internal static class Program
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex SkippedApplicationUrl = new(@"talenthop|bestjobtool", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex ResidenceQuestion = new(@"city\s*,\s*state\s+and\s+zip[\s\S]*currently residing", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static bool IsDiagnosticRun => string.Equals(
+        Environment.GetEnvironmentVariable("LINKEDIN_JOB_SEARCH_DIAGNOSTIC"),
+        "1",
+        StringComparison.Ordinal);
 
     public static async Task<int> Main()
     {
@@ -777,6 +781,16 @@ internal static class Program
                 return true;
             }
 
+            if (IsDiagnosticRun)
+            {
+                keepExternalPageForTroubleshooting = true;
+                Console.WriteLine();
+                Console.WriteLine("Diagnostic run stopped at the external application page. No answers were filled or submitted.");
+                Console.WriteLine("Inspect the open job tab, then press Enter here to close the runner.");
+                await Console.In.ReadLineAsync(cancellationToken);
+                return false;
+            }
+
             Console.WriteLine();
             Console.WriteLine("Finish any unanswered application questions and submit the application in the open job tab.");
             Console.WriteLine("If the page already shows a success message, do not submit again. Press SPACE here to close this tab and continue to LinkedIn's next listing.");
@@ -834,6 +848,7 @@ internal static class Program
         PersonalProfile? personalProfile,
         CancellationToken cancellationToken)
     {
+        var applyNavigationAttempted = false;
         for (var step = 0; step < 12; step++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -850,6 +865,56 @@ internal static class Program
             if (page.Url.Contains("theladders", StringComparison.OrdinalIgnoreCase))
             {
                 return await CompleteTheLaddersApplicationAsync(page, cancellationToken);
+            }
+
+            var applicationFieldCandidates = page.Locator(
+                "input:not([type='hidden']):not([type='submit']):not([type='button']), textarea, select");
+            var applicationFieldCount = await applicationFieldCandidates.EvaluateAllAsync<int>(
+                "elements => elements.filter(element => { " +
+                "const type = (element.getAttribute('type') || '').toLowerCase(); " +
+                "const description = [element.getAttribute('placeholder'), element.getAttribute('aria-label'), element.getAttribute('name')].filter(Boolean).join(' '); " +
+                "return element.getClientRects().length > 0 && type !== 'search' && " +
+                "!element.closest('header, nav, [role=\"navigation\"]') && !/search|job title/i.test(description); " +
+                "}).length");
+            if (applicationFieldCount == 0)
+            {
+                if (applyNavigationAttempted)
+                {
+                    Console.WriteLine("  The Apply button did not reveal application fields; leaving the page for manual review.");
+                    return false;
+                }
+
+                var applyButtons = await GetVisibleButtonsAsync(
+                    page.GetByRole(AriaRole.Button, new()
+                    {
+                        NameRegex = new Regex(@"\bApply\b", RegexOptions.IgnoreCase)
+                    }));
+                var navigationApplyButtons = new List<ILocator>();
+                foreach (var button in applyButtons)
+                {
+                    if (!await button.EvaluateAsync<bool>("element => element.closest('form') !== null"))
+                    {
+                        navigationApplyButtons.Add(button);
+                    }
+                }
+
+                if (navigationApplyButtons.Count == 1)
+                {
+                    applyNavigationAttempted = true;
+                    Console.WriteLine("  No application fields are present; opening the application form with the Apply button.");
+                    await navigationApplyButtons[0].ClickAsync();
+                    await page.WaitForTimeoutAsync(700);
+                    continue;
+                }
+
+                Console.WriteLine("  No application fields or unique Apply button were found; leaving the page for manual review.");
+                return false;
+            }
+
+            if (IsDiagnosticRun)
+            {
+                Console.WriteLine("  Application fields are visible; diagnostic mode is leaving them untouched.");
+                return false;
             }
 
             try
