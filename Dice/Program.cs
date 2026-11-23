@@ -128,6 +128,8 @@ internal static class Program
             }
 
             Console.WriteLine($"\nFinished. Submitted {appliedThisRun} application(s) in this run.");
+            Console.WriteLine("Press Enter to close the browser and exit.");
+            await Console.In.ReadLineAsync();
             return 0;
         }
         catch (OperationCanceledException)
@@ -418,6 +420,14 @@ internal static class Program
             await page.GotoAsync("https://www.dice.com/dashboard/login", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
         }
 
+        // If Dice redirected away from the login page (e.g. to /home-feed), the session
+        // is still active — treat this as already signed in and return without submitting credentials.
+        if (!page.Url.Contains("/dashboard/login", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"Dice redirected to {page.Url} instead of the login page — session is still active; skipping credential submission.");
+            return;
+        }
+
         var emailField = page.Locator("input[type='email']").First;
         try
         {
@@ -481,11 +491,32 @@ internal static class Program
             return false;
         }
 
-        var applyAction = page.Locator("a[data-testid='apply-button'], button[data-testid='apply-button'], [role='button'][data-testid='apply-button']");
-        var visibleApplyActions = await GetVisibleLocatorsAsync(applyAction);
-        if (visibleApplyActions.Count != 1)
+        // The page navigates with DOMContentLoaded but the apply button is rendered by React.
+        // Wait up to 10 s for it to appear before querying visibility.
+        var applyAction = page.Locator("[data-testid='apply-button']");
+        try
         {
-            throw new PlaywrightException($"Could not find a unique Dice Apply control for {job.Url}. The listing may not support Easy Apply.");
+            await applyAction.First.WaitForAsync(new LocatorWaitForOptions
+            {
+                State = WaitForSelectorState.Visible,
+                Timeout = 10_000
+            });
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine($"No Easy Apply button appeared for {job.Url}; skipping (listing may not support Easy Apply).");
+            return false;
+        }
+
+        var visibleApplyActions = await GetVisibleLocatorsAsync(applyAction);
+        if (visibleApplyActions.Count == 0)
+        {
+            Console.WriteLine($"No Easy Apply button found for {job.Url}; skipping.");
+            return false;
+        }
+        if (visibleApplyActions.Count > 1)
+        {
+            Console.WriteLine($"Found {visibleApplyActions.Count} Apply buttons for {job.Url}; using the first one.");
         }
         await visibleApplyActions[0].ClickAsync(new LocatorClickOptions { Timeout = 20_000 });
         await ClickUniqueButtonAsync(page, "Next", cancellationToken);
@@ -505,7 +536,7 @@ internal static class Program
         for (var step = 0; step < 8; step++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var submitButtons = await GetVisibleLocatorsAsync(page.GetByRole(AriaRole.Button, new() { Name = "Submit", Exact = true }));
+            var (submitButtons, nextButtons) = await WaitForWizardActionsAsync(page, cancellationToken);
             if (submitButtons.Count > 1)
             {
                 throw new PlaywrightException("Several Submit buttons are visible; stopping without guessing.");
@@ -548,7 +579,6 @@ internal static class Program
                 await WaitForManualInputAsync(cancellationToken);
             }
 
-            var nextButtons = await GetVisibleLocatorsAsync(page.GetByRole(AriaRole.Button, new() { Name = "Next", Exact = true }));
             if (nextButtons.Count != 1)
             {
                 throw new PlaywrightException("Dice did not show a unique Next or Submit button after reviewing the application fields.");
@@ -569,15 +599,57 @@ internal static class Program
         }
     }
 
+    private static async Task<(List<ILocator> Submit, List<ILocator> Next)> WaitForWizardActionsAsync(
+        IPage page,
+        CancellationToken cancellationToken)
+    {
+        var submit = page.GetByRole(AriaRole.Button, new() { Name = "Submit", Exact = true });
+        var next = page.GetByRole(AriaRole.Button, new() { Name = "Next", Exact = true });
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var submitButtons = await GetVisibleLocatorsAsync(submit);
+            var nextButtons = await GetVisibleLocatorsAsync(next);
+            if (submitButtons.Count > 0 || nextButtons.Count > 0 || DateTimeOffset.UtcNow >= deadline)
+            {
+                return (submitButtons, nextButtons);
+            }
+
+            await page.WaitForTimeoutAsync(250);
+        }
+    }
+
     private static async Task ClickUniqueButtonAsync(IPage page, string name, CancellationToken cancellationToken)
     {
-        var buttons = await GetVisibleLocatorsAsync(page.GetByRole(AriaRole.Button, new() { Name = name, Exact = true }));
-        if (buttons.Count != 1)
+        // Easy Apply navigates to the wizard before its buttons render. A count of
+        // zero here is that gap; more than one visible match is still ambiguous.
+        var buttons = page.GetByRole(AriaRole.Button, new() { Name = name, Exact = true });
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+        while (true)
         {
-            throw new PlaywrightException($"Could not find a unique {name} button. Stopping without retrying.");
+            cancellationToken.ThrowIfCancellationRequested();
+            var visible = await GetVisibleLocatorsAsync(buttons);
+            if (visible.Count == 1)
+            {
+                await visible[0].ClickAsync(new LocatorClickOptions { Timeout = 20_000 });
+                return;
+            }
+
+            if (visible.Count > 1)
+            {
+                throw new PlaywrightException(
+                    $"Could not find a unique {name} button ({visible.Count} visible). Stopping without retrying. Current page: {page.Url}");
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                throw new PlaywrightException(
+                    $"Could not find a unique {name} button (none visible after waiting). Stopping without retrying. Current page: {page.Url}");
+            }
+
+            await page.WaitForTimeoutAsync(250);
         }
-        cancellationToken.ThrowIfCancellationRequested();
-        await buttons[0].ClickAsync(new LocatorClickOptions { Timeout = 20_000 });
     }
 
     private static async Task WaitForApplicationSuccessAsync(IPage page, CancellationToken cancellationToken)
