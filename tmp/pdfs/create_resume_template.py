@@ -6,7 +6,8 @@ from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Paragraph
 
-out = r"C:\Users\18502\Documents\Repos\Job Applicator\templates\Resume.pdf"
+from pathlib import Path
+out = str(Path(__file__).resolve().parents[2] / "templates" / "Resume.pdf")
 page_w, page_h = letter
 margin = 0.62 * inch
 content_w = page_w - 2 * margin

@@ -131,9 +131,11 @@ public static class AnswerMatcher
         }
 
         var excerpts = Regex.Split(resumeText, @"(?<=[.!?])\s+|\r?\n")
-            .Select(excerpt => excerpt.Trim().Trim('-', '*', '\u2022', ' '))
+            .Select(excerpt => excerpt.Trim())
+            .Where(excerpt => !excerpt.StartsWith('#'))
+            .Select(excerpt => excerpt.Trim('-', '*', '\u2022', ' '))
             .Where(excerpt => !IsSensitive(excerpt))
-            .Where(excerpt => excerpt.Length > 0)
+            .Where(excerpt => excerpt.Length > 0 && Normalize(excerpt).Split(' ', StringSplitOptions.RemoveEmptyEntries).Length >= 3)
             .Select(excerpt => new { Text = excerpt, Score = Similarity(question, excerpt) })
             .Where(match => match.Score >= ResumeExcerptThreshold)
             .OrderByDescending(match => match.Score)

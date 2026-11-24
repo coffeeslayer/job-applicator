@@ -11,7 +11,9 @@ This repository contains local job-search tools for LinkedIn, Dice, Greenhouse, 
 - `Shared/` - profile parsing code shared by the runners.
 - `personal.md` - your private, reusable application answers.
 - `resume.md` - your private resume text used for resume-grounded suggestions.
-- `Resume.pdf` - your private resume attachment.
+- `experience-bank.md` - your private verified master experience bank used for per-job resume tailoring.
+- `Resume.pdf` - your private fallback resume attachment.
+- `tailored-resumes/` - private per-job archived tailored resumes (`*.pdf`, `resume.md`, `job-description.txt`, `tailor-report.json`).
 - `templates/` - blank starter files; these do not contain personal data.
 - `.env.example` - starter environment settings for the Dice and Glassdoor runners.
 
@@ -64,6 +66,18 @@ Use the same restore, build, Playwright install, and `dotnet run` sequence from 
 The runners have different application behavior. LinkedIn Easy Apply answers are left for your review and manual submission; its external-site flow may submit when all supported answers are complete. Dice, Greenhouse, and Glassdoor can submit completed applications automatically. Review the platform README and your profile answers before each run, and inspect the confirmation state before rerunning an application.
 
 The runners keep browser profiles and application history under your Windows local app data folder. Treat those directories as private because the browser profiles contain signed-in sessions. Do not commit credentials, application history, resumes, or profile details.
+
+## Per-job resume tailoring
+
+All four runners (`LinkedIn`, `Dice`, `Greenhouse`, and `Glassdoor`) automatically tailor a 2-page ATS-friendly PDF resume for each job using `Shared/ResumeTailor.cs` and your private `experience-bank.md` (falling back to `resume.md` and `Resume.pdf` if unconfigured or unavailable).
+
+Configure the provider in the git-ignored repository-root `.env` file (see `.env.example`):
+
+- `RESUME_TAILOR_PROVIDER=auto` (default: uses Gemini when `GEMINI_API_KEY` is set, else local model; set `gemini`, `local`, or `off`)
+- `GEMINI_API_KEY` and `GEMINI_MODEL` (defaults to `gemini-3.8-flash`)
+- Or reuse `LINKEDIN_JOB_SEARCH_LOCAL_MODEL_URL` and `LINKEDIN_JOB_SEARCH_LOCAL_MODEL` for a local OpenAI-compatible model
+
+Each generated resume is archived under `tailored-resumes/` (ignored by Git) alongside the scraped job description and a `tailor-report.json` listing matched keywords and any factual guardrail adjustments.
 
 ## Optional local resume drafts
 

@@ -60,6 +60,8 @@ internal static class Program
             AppContext.BaseDirectory,
             Environment.CurrentDirectory);
         var personalProfilePath = PersonalProfile.FindPath(projectRoot, Environment.CurrentDirectory);
+        var repositoryRoot = Path.GetDirectoryName(personalProfilePath) ?? projectRoot;
+        using var logTee = ConsoleLogTee.Attach(repositoryRoot, "LinkedIn");
         var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
         var residenceCityStateZip = personalProfile?.Residence;
         var resumeTextPath = ResumePaths.GetResumePath(projectRoot);
@@ -128,33 +130,39 @@ internal static class Program
         }
         using var localModelLifetime = localModel;
 
-        using var playwright = await Playwright.CreateAsync();
+        IPlaywright? playwright = null;
         IBrowserContext? context = null;
+        ResumeTailorService? resumeTailor = null;
+        TaskCompletionSource? browserClosed = null;
+        IPage? activePage = null;
+        var keepOpenReason = "LinkedIn runner finished.";
 
         try
         {
+            playwright = await Playwright.CreateAsync();
+            resumeTailor = await ResumeTailorService.CreateAsync(repositoryRoot, personalProfile, playwright);
             context = await playwright.Chromium.LaunchPersistentContextAsync(
                 profileDirectory,
-                new BrowserTypeLaunchPersistentContextOptions { Headless = false });
+                new BrowserTypeLaunchPersistentContextOptions { Headless = false, Timeout = 0 });
+            NoTimeoutPlaywright.Configure(context);
+            browserClosed = NoTimeoutPlaywright.TrackBrowserClose(context);
 
             var page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+            NoTimeoutPlaywright.Configure(page);
+            activePage = page;
             await page.AddInitScriptAsync(MouseIdleTrackingScript);
             await page.EvaluateAsync(MouseIdleTrackingScript);
-            await page.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+            await page.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
 
             var seenListings = new HashSet<string>(StringComparer.Ordinal);
             Console.WriteLine("A persistent Chromium window is open. Sign in to LinkedIn there if needed.");
-            Console.WriteLine("When the job search results are visible, press Enter here to begin.");
-            if (Console.ReadLine() is null)
-            {
-                Console.WriteLine("No console input is available; closing without scanning.");
-                return 0;
-            }
+            await WaitForLinkedInReadyAsync(page, repositoryRoot, cancellation.Token);
 
             while (!cancellation.IsCancellationRequested)
             {
                 await ProcessListingsAsync(
                     page,
+                    repositoryRoot,
                     appliedJobs,
                     appliedJobsPath,
                     uncertainJobs,
@@ -168,12 +176,21 @@ internal static class Program
                     residenceCityStateZip,
                     personalProfile,
                     localModelAvailable ? localModel : null,
+                    resumeTailor,
                     seenListings,
                     cancellation.Token);
 
                 if (page.IsClosed)
                 {
-                    Console.WriteLine("The LinkedIn browser window was closed. Scan finished.");
+                    keepOpenReason = "The LinkedIn browser window was closed. Scan finished.";
+                    Console.WriteLine(keepOpenReason);
+                    break;
+                }
+
+                if (Console.IsInputRedirected)
+                {
+                    keepOpenReason = "LinkedIn finished scanning the current batch (non-interactive console).";
+                    Console.WriteLine(keepOpenReason);
                     break;
                 }
 
@@ -196,27 +213,27 @@ internal static class Program
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("Run cancelled. No further form or listing actions will be taken.");
+            keepOpenReason = "Run cancelled. No further form or listing actions will be taken.";
+            Console.WriteLine(keepOpenReason);
             return 0;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("LinkedIn runner failed with an exception:");
             Console.Error.WriteLine(ex.ToString());
-            if (context is not null)
-            {
-                Console.WriteLine("Chromium and the failed application page are being kept open for troubleshooting. Press Enter after inspecting them to close the browser and exit.");
-                await Console.In.ReadLineAsync();
-            }
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(activePage, repositoryRoot, "LinkedIn", $"Unhandled exception: {ex.Message}");
+            keepOpenReason = "LinkedIn runner stopped after an error.";
             return 1;
         }
         finally
         {
             Console.CancelKeyPress -= cancelHandler;
-            if (context is not null)
+            await NoTimeoutPlaywright.KeepBrowserOpenUntilClosedAsync(context, browserClosed, keepOpenReason);
+            if (resumeTailor is not null)
             {
-                await context.CloseAsync();
+                await resumeTailor.DisposeAsync();
             }
+            playwright?.Dispose();
         }
     }
 
@@ -297,8 +314,61 @@ internal static class Program
         }
     }
 
+    private static bool IsLinkedInSignInUrl(string url) =>
+        url.Contains("/login", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("/uas/login", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("/checkpoint", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("/authwall", StringComparison.OrdinalIgnoreCase);
+
+    private static async Task WaitForLinkedInReadyAsync(IPage page, string projectRoot, CancellationToken cancellationToken)
+    {
+        var lastReminder = DateTimeOffset.UtcNow;
+        var dumpedSignIn = false;
+        while (!page.IsClosed && IsLinkedInSignInUrl(page.Url))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (DateTimeOffset.UtcNow - lastReminder > TimeSpan.FromSeconds(20))
+            {
+                lastReminder = DateTimeOffset.UtcNow;
+                Console.WriteLine($"Waiting for LinkedIn sign-in in Chromium (no timeout). Current page: {page.Url}");
+                if (!dumpedSignIn)
+                {
+                    dumpedSignIn = true;
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "LinkedIn", "Waiting for LinkedIn sign-in");
+                }
+            }
+            await page.WaitForTimeoutAsync(1000);
+        }
+
+        if (page.IsClosed)
+        {
+            return;
+        }
+
+        if (!page.Url.Contains("/jobs/", StringComparison.OrdinalIgnoreCase))
+        {
+            await page.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+        }
+
+        var started = DateTimeOffset.UtcNow;
+        while (!page.IsClosed && DateTimeOffset.UtcNow - started < TimeSpan.FromSeconds(15))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var listings = await ReadVisibleJobListingsAsync(page);
+            if (listings.Count > 0)
+            {
+                Console.WriteLine($"LinkedIn job search results ready ({listings.Count} visible card(s)); starting scan automatically.");
+                return;
+            }
+            await page.WaitForTimeoutAsync(500);
+        }
+
+        await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "LinkedIn", "LinkedIn search cards not yet visible after initial load");
+    }
+
     private static async Task ProcessListingsAsync(
         IPage page,
+        string projectRoot,
         HashSet<string> appliedJobs,
         string appliedJobsPath,
         HashSet<string> uncertainJobs,
@@ -312,11 +382,13 @@ internal static class Program
         string? residenceCityStateZip,
         PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
+        ResumeTailorService? resumeTailor,
         HashSet<string> seenThisRun,
         CancellationToken cancellationToken)
     {
         var stagnantRounds = 0;
         var reportedMissingListings = false;
+        var seenJobIdsThisRun = new HashSet<string>(StringComparer.Ordinal);
 
         while (stagnantRounds < 3)
         {
@@ -363,28 +435,94 @@ internal static class Program
                     Console.WriteLine($"Skipping listing with an unconfirmed prior submission: {title} ({jobId})");
                     continue;
                 }
+                if (SkippedApplicationUrl.IsMatch(cardText))
+                {
+                    Console.WriteLine($"Skipping excluded employer/listing: {title} ({jobId ?? "ID pending"})");
+                    continue;
+                }
+
+                await DismissStaleLinkedInDialogsAsync(page);
+                if (!page.Url.Contains("/jobs/search", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"  LinkedIn navigated away from search results ({page.Url}); restoring search URL.");
+                    await page.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+                    await page.WaitForTimeoutAsync(800);
+                    break;
+                }
 
                 var previousDetailsJobId = JobListingDiscovery.ExtractCurrentJobId(page.Url);
                 Console.WriteLine(
                     $"Selecting left-pane listing: {title} " +
                     $"({jobId ?? "ID pending selection"}; current details ID before selection: {previousDetailsJobId ?? "none"}).");
+                await NoTimeoutPlaywright.SafeScrollIntoViewAsync(card);
                 var jobLink = card.Locator("a[href*='/jobs/view/']").First;
                 if (await jobLink.CountAsync() > 0 && await jobLink.IsVisibleAsync())
                 {
-                    await jobLink.ClickAsync();
+                    await jobLink.ClickAsync(new LocatorClickOptions { Force = true });
                 }
                 else
                 {
-                    await card.ClickAsync();
+                    await card.ClickAsync(new LocatorClickOptions { Force = true });
                 }
-                await page.WaitForTimeoutAsync(700);
-                jobId ??= JobListingDiscovery.ExtractCurrentJobId(page.Url);
+                for (var detailWait = 0; detailWait < 10; detailWait++)
+                {
+                    await page.WaitForTimeoutAsync(300);
+                    var updatedDetailsId = JobListingDiscovery.ExtractCurrentJobId(page.Url);
+                    if (updatedDetailsId is not null && updatedDetailsId != previousDetailsJobId)
+                    {
+                        break;
+                    }
+                }
+                var updatedDetailsJobId = JobListingDiscovery.ExtractCurrentJobId(page.Url);
+                if (jobId is null && updatedDetailsJobId is not null && updatedDetailsJobId == previousDetailsJobId)
+                {
+                    Console.WriteLine($"  Details pane stayed on previous job ID ({previousDetailsJobId}); skipping to avoid reprocessing it.");
+                    continue;
+                }
+                jobId ??= updatedDetailsJobId;
                 if (jobId is null)
                 {
                     Console.WriteLine(
-                        "  The listing was selected, but no job ID could be verified from its card or updated details URL; " +
+                        $"  The listing was selected, but no job ID could be verified from its card or updated details URL ({page.Url}); " +
                         "skipping application controls to avoid processing the wrong listing.");
                     continue;
+                }
+                if (!seenJobIdsThisRun.Add(jobId))
+                {
+                    Console.WriteLine($"  Selected listing was already processed earlier in this run ({jobId}); skipping duplicate.");
+                    continue;
+                }
+                // Wait briefly for LinkedIn's right-hand details pane to re-render the newly selected listing.
+                var normalizedTitlePrefix = Regex.Replace(title, @"\(Verified job\)", "", RegexOptions.IgnoreCase).Trim();
+                if (normalizedTitlePrefix.Length > 24)
+                {
+                    normalizedTitlePrefix = normalizedTitlePrefix[..24].Trim();
+                }
+                for (var renderWait = 0; renderWait < 8; renderWait++)
+                {
+                    await page.WaitForTimeoutAsync(250);
+                    if (string.IsNullOrWhiteSpace(normalizedTitlePrefix))
+                    {
+                        break;
+                    }
+                    var rightPaneMatches = await page.EvaluateAsync<bool>(
+                        """
+                        prefix => {
+                            const needle = (prefix || '').toLowerCase();
+                            if (!needle) return true;
+                            const headings = Array.from(document.querySelectorAll('h1, h2, [class*="job-title" i], [class*="top-card" i]'));
+                            return headings.some(el => {
+                                const rect = el.getBoundingClientRect();
+                                return rect.width > 0 && rect.height > 0 && rect.left >= window.innerWidth * 0.35 &&
+                                    (el.innerText || '').toLowerCase().includes(needle);
+                            });
+                        }
+                        """,
+                        normalizedTitlePrefix);
+                    if (rightPaneMatches)
+                    {
+                        break;
+                    }
                 }
                 if (appliedJobs.Contains(jobId))
                 {
@@ -398,7 +536,7 @@ internal static class Program
                 }
 
                 var easyApplyButtons = await GetVisibleButtonsAsync(
-                    page.GetByRole(AriaRole.Button, new() { Name = "Easy Apply", Exact = true }));
+                    page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*Easy Apply\b", RegexOptions.IgnoreCase) }));
                 if (easyApplyButtons.Count > 1)
                 {
                     Console.WriteLine("  Multiple Easy Apply buttons are visible; moving on rather than guessing.");
@@ -417,31 +555,6 @@ internal static class Program
                     externalApplyLinks.Count,
                     applyButtons.Count);
 
-                if (buttonKind == ApplyButtonKind.ExternalApplyLink)
-                {
-                    if (ShouldSkipApplicationUrl(externalApplyLinks[0].Destination.AbsoluteUri))
-                    {
-                        Console.WriteLine($"  Skipping excluded application URL: {externalApplyLinks[0].Destination}");
-                        continue;
-                    }
-                    if (!await OpenExternalApplyAndPauseAsync(
-                            page,
-                            externalApplyLinks[0].Destination,
-                            title,
-                            jobId,
-                            appliedJobs,
-                            appliedJobsPath,
-                            resumeText,
-                            residenceCityStateZip,
-                            personalProfile,
-                            localModel,
-                            cancellationToken))
-                    {
-                        return;
-                    }
-                    continue;
-                }
-
                 if (buttonKind == ApplyButtonKind.None)
                 {
                     if (externalApplyLinks.Count > 1)
@@ -451,6 +564,52 @@ internal static class Program
                     else
                     {
                         Console.WriteLine("  No unique supported Apply button or external Apply link; moving on.");
+                    }
+                    continue;
+                }
+
+                TailoredResumeArtifact? tailoredResume = null;
+                async Task<TailoredResumeArtifact?> EnsureTailoredResumeAsync()
+                {
+                    if (tailoredResume is not null || resumeTailor is null)
+                    {
+                        return tailoredResume;
+                    }
+                    var (jdText, company) = await JobDescriptionExtractor.ExtractFromPageAsync(page, "LinkedIn", title);
+                    tailoredResume = await resumeTailor.TailorForJobAsync(
+                        new JobTailoringContext("LinkedIn", title, company, page.Url, jdText),
+                        cancellationToken);
+                    return tailoredResume;
+                }
+
+                if (buttonKind == ApplyButtonKind.ExternalApplyLink)
+                {
+                    if (ShouldSkipApplicationUrl(externalApplyLinks[0].Destination.AbsoluteUri))
+                    {
+                        Console.WriteLine($"  Skipping excluded application URL: {externalApplyLinks[0].Destination}");
+                        continue;
+                    }
+                    var (jdText, company) = resumeTailor is null
+                        ? ("", "")
+                        : await JobDescriptionExtractor.ExtractFromPageAsync(page, "LinkedIn", title);
+                    if (!await OpenExternalApplyAndPauseAsync(
+                            page,
+                            projectRoot,
+                            externalApplyLinks[0].Destination,
+                            title,
+                            jobId,
+                            appliedJobs,
+                            appliedJobsPath,
+                            resumeText,
+                            residenceCityStateZip,
+                            personalProfile,
+                            localModel,
+                            cancellationToken,
+                            resumeTailor,
+                            company,
+                            jdText))
+                    {
+                        return;
                     }
                     continue;
                 }
@@ -472,9 +631,13 @@ internal static class Program
                         Console.WriteLine($"  Skipping excluded application URL: {destination}");
                         continue;
                     }
+                    var (jdText, company) = destination is not null && resumeTailor is not null
+                        ? await JobDescriptionExtractor.ExtractFromPageAsync(page, "LinkedIn", title)
+                        : ("", "");
                     if (destination is null ||
                         !await OpenExternalApplyAndPauseAsync(
                             page,
+                            projectRoot,
                             destination,
                             title,
                             jobId,
@@ -484,12 +647,18 @@ internal static class Program
                             residenceCityStateZip,
                             personalProfile,
                             localModel,
-                            cancellationToken))
+                            cancellationToken,
+                            resumeTailor,
+                            company,
+                            jdText))
                     {
                         return;
                     }
                     continue;
                 }
+
+                await EnsureTailoredResumeAsync();
+                var easyApplyResumeText = tailoredResume?.MarkdownText ?? resumeText;
 
                 var pagesBeforeApply = page.Context.Pages.ToHashSet();
                 await applyButton.ClickAsync();
@@ -534,11 +703,12 @@ internal static class Program
                     questionAnswers,
                     questionAnswersPath,
                     resumeAnswers,
-                    resumeText,
+                    easyApplyResumeText,
                     residenceCityStateZip,
                     personalProfile,
                     localModel,
-                    cancellationToken);
+                    cancellationToken,
+                    tailoredResume?.PdfPath);
 
                 if (buttonKind == ApplyButtonKind.Apply &&
                     result == ApplyResult.UnsupportedDialog &&
@@ -575,7 +745,16 @@ internal static class Program
                         uncertainJobs.Add(jobId);
                         await SaveListingIdsAsync(uncertainJobsPath, uncertainJobs);
                     }
-                    Console.WriteLine($"  {result}; moving on without guessing or retrying.");
+                    if (result == ApplyResult.UnsupportedDialog)
+                    {
+                        await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(
+                            page,
+                            projectRoot,
+                            "LinkedIn",
+                            $"UnsupportedDialog for {title} ({jobId}) on {page.Url}");
+                        await DismissStaleLinkedInDialogsAsync(page);
+                    }
+                    Console.WriteLine($"  {result}; moving on without guessing or retrying (url: {page.Url}).");
                 }
             }
 
@@ -679,44 +858,48 @@ internal static class Program
         return visibleButtons;
     }
 
+    private sealed class ExternalLinkProbe
+    {
+        public string Href { get; set; } = "";
+        public string[] SpanTexts { get; set; } = [];
+    }
+
     private static async Task<List<ExternalApplyLink>> GetVisibleExternalApplyLinksAsync(IPage page)
     {
-        var links = page.Locator("a[href]");
         var matches = new List<ExternalApplyLink>();
         var currentPage = new Uri(page.Url);
-        for (var index = 0; index < await links.CountAsync(); index++)
+        var probes = await page.EvaluateAsync<ExternalLinkProbe[]>(
+            """
+            () => {
+                const isVisible = el => {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    if (s.display === "none" || s.visibility === "hidden") return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                return Array.from(document.querySelectorAll("a[href]"))
+                    .filter(isVisible)
+                    .map(link => ({
+                        href: link.getAttribute("href") || "",
+                        spanTexts: Array.from(link.querySelectorAll("span"))
+                            .filter(isVisible)
+                            .map(sp => (sp.innerText || "").trim())
+                            .filter(Boolean)
+                    }))
+                    .filter(item => item.href.length > 0 && item.spanTexts.length > 0);
+            }
+            """);
+
+        foreach (var probe in probes)
         {
-            var link = links.Nth(index);
-            if (!await link.IsVisibleAsync())
+            var applySpanText = probe.SpanTexts.FirstOrDefault(ApplyButtonHandling.IsApplySpanText) ?? "";
+            if (!ApplyButtonHandling.IsExternalApplyLink(currentPage, applySpanText, probe.Href))
             {
                 continue;
             }
 
-            var applySpanText = "";
-            var spans = link.Locator("span");
-            for (var spanIndex = 0; spanIndex < await spans.CountAsync(); spanIndex++)
-            {
-                var span = spans.Nth(spanIndex);
-                if (!await span.IsVisibleAsync())
-                {
-                    continue;
-                }
-
-                var text = await span.InnerTextAsync();
-                if (ApplyButtonHandling.IsApplySpanText(text))
-                {
-                    applySpanText = text;
-                    break;
-                }
-            }
-
-            var href = await link.GetAttributeAsync("href");
-            if (!ApplyButtonHandling.IsExternalApplyLink(currentPage, applySpanText, href))
-            {
-                continue;
-            }
-
-            var destination = ApplyButtonHandling.ResolveDestination(currentPage, href);
+            var destination = ApplyButtonHandling.ResolveDestination(currentPage, probe.Href);
             if (destination is not null)
             {
                 matches.Add(new ExternalApplyLink(destination));
@@ -728,6 +911,7 @@ internal static class Program
 
     private static async Task<bool> OpenExternalApplyAndPauseAsync(
         IPage sourcePage,
+        string projectRoot,
         Uri destination,
         string jobTitle,
         string jobId,
@@ -737,7 +921,10 @@ internal static class Program
         string? residenceCityStateZip,
         PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ResumeTailorService? resumeTailor = null,
+        string company = "",
+        string jobDescription = "")
     {
         var keepExternalPageForTroubleshooting = false;
         if (!ApplyButtonHandling.IsSafeExternalDestination(destination))
@@ -747,11 +934,14 @@ internal static class Program
         }
 
         var externalPage = await sourcePage.Context.NewPageAsync();
+        NoTimeoutPlaywright.Configure(externalPage);
         try
         {
             await externalPage.GotoAsync(
                 destination.AbsoluteUri,
                 new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+            // Allow immediate client-side redirects (e.g. LinkedIn /redir/ or ATS bounce pages) to settle.
+            await externalPage.WaitForTimeoutAsync(900);
             if (ShouldSkipApplicationUrl(externalPage.Url))
             {
                 Console.WriteLine($"  Skipping excluded application URL: {externalPage.Url}");
@@ -763,16 +953,45 @@ internal static class Program
                 return !sourcePage.IsClosed;
             }
             await AcceptCookieBannerAsync(externalPage);
+            if (ShouldSkipApplicationUrl(externalPage.Url))
+            {
+                Console.WriteLine($"  Skipping excluded application URL after redirect: {externalPage.Url}");
+                return !sourcePage.IsClosed;
+            }
+            if (externalPage.Url.Contains("myworkdayjobs", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("  Workday application detected after redirect; closing this tab and skipping to the next LinkedIn listing.");
+                return !sourcePage.IsClosed;
+            }
+
+            TailoredResumeArtifact? tailoredResume = null;
+            if (resumeTailor is not null)
+            {
+                var effectiveJd = jobDescription;
+                var effectiveCompany = company;
+                if (string.IsNullOrWhiteSpace(effectiveJd) || effectiveJd.Length < 200)
+                {
+                    var (extJd, extCompany) = await JobDescriptionExtractor.ExtractFromPageAsync(externalPage, "External", jobTitle);
+                    if (extJd.Length > effectiveJd.Length) effectiveJd = extJd;
+                    if (string.IsNullOrWhiteSpace(effectiveCompany)) effectiveCompany = extCompany;
+                }
+                tailoredResume = await resumeTailor.TailorForJobAsync(
+                    new JobTailoringContext("LinkedIn", jobTitle, effectiveCompany, externalPage.Url, effectiveJd),
+                    cancellationToken);
+            }
+            var effectiveResumeText = tailoredResume?.MarkdownText ?? resumeText;
+
             Console.WriteLine();
             Console.WriteLine($"External company application opened for {jobTitle}.");
             var submitted = await CompleteExternalApplicationAsync(
                 externalPage,
                 jobTitle,
                 localModel,
-                resumeText,
+                effectiveResumeText,
                 residenceCityStateZip,
                 personalProfile,
-                cancellationToken);
+                cancellationToken,
+                tailoredResume?.PdfPath);
             if (submitted || ContainsExternalConfirmation(await externalPage.Locator("body").InnerTextAsync()))
             {
                 appliedJobs.Add(jobId);
@@ -796,11 +1015,15 @@ internal static class Program
             Console.WriteLine("If the page already shows a success message, do not submit again. Press SPACE here to close this tab and continue to LinkedIn's next listing.");
             if (Console.IsInputRedirected)
             {
-                Console.WriteLine("Spacebar input is unavailable in redirected input; press Enter after finishing instead.");
-                if (await Console.In.ReadLineAsync(cancellationToken) is null)
+                keepExternalPageForTroubleshooting = true;
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(externalPage, projectRoot, "LinkedIn", $"External application paused for manual review: {jobTitle}");
+                Console.WriteLine($"  Leaving external application tab open for {jobTitle} and continuing to the next LinkedIn listing.");
+                if (!sourcePage.IsClosed)
                 {
-                    return false;
+                    await sourcePage.BringToFrontAsync();
+                    await sourcePage.WaitForTimeoutAsync(400);
                 }
+                return !sourcePage.IsClosed;
             }
             else
             {
@@ -825,6 +1048,23 @@ internal static class Program
             Console.WriteLine("  Recorded this job after your manual completion handoff.");
             return true;
         }
+        catch (PlaywrightException ex)
+        {
+            keepExternalPageForTroubleshooting = true;
+            Console.Error.WriteLine($"  External application error for {jobTitle} ({ex.Message}); leaving tab open and continuing to the next listing.");
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(externalPage, projectRoot, "LinkedIn", $"External PlaywrightException on {jobTitle}: {ex.Message}");
+            if (!sourcePage.IsClosed)
+            {
+                try
+                {
+                    await sourcePage.BringToFrontAsync();
+                }
+                catch (PlaywrightException)
+                {
+                }
+            }
+            return !sourcePage.IsClosed;
+        }
         catch
         {
             keepExternalPageForTroubleshooting = true;
@@ -846,7 +1086,8 @@ internal static class Program
         string resumeText,
         string? residenceCityStateZip,
         PersonalProfile? personalProfile,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? tailoredResumePdfPath = null)
     {
         var applyNavigationAttempted = false;
         for (var step = 0; step < 12; step++)
@@ -872,9 +1113,13 @@ internal static class Program
             var applicationFieldCount = await applicationFieldCandidates.EvaluateAllAsync<int>(
                 "elements => elements.filter(element => { " +
                 "const type = (element.getAttribute('type') || '').toLowerCase(); " +
+                "const tag = element.tagName.toLowerCase(); " +
                 "const description = [element.getAttribute('placeholder'), element.getAttribute('aria-label'), element.getAttribute('name')].filter(Boolean).join(' '); " +
-                "return element.getClientRects().length > 0 && type !== 'search' && " +
-                "!element.closest('header, nav, [role=\"navigation\"]') && !/search|job title/i.test(description); " +
+                "if (element.getClientRects().length === 0 || type === 'search') return false; " +
+                "if (element.closest('header, nav, [role=\"navigation\"]')) return false; " +
+                "if (/search|job title/i.test(description)) return false; " +
+                "if (tag === 'select' && !element.closest('form, [role=\"dialog\"]') && /^all\\s+(countries|locations|categories|departments)/i.test((element.options?.[0]?.text || '').trim())) return false; " +
+                "return true; " +
                 "}).length");
             if (applicationFieldCount == 0)
             {
@@ -926,7 +1171,8 @@ internal static class Program
                     resumeText,
                     residenceCityStateZip,
                     cancellationToken,
-                    personalProfile);
+                    personalProfile,
+                    tailoredResumePdfPath);
                 if (draftResult.FilledCount > 0)
                 {
                     Console.WriteLine($"  Filled {draftResult.FilledCount} blank field(s) from resume-supported answers.");
@@ -957,12 +1203,12 @@ internal static class Program
                 return false;
             }
 
-            var invalidRequired = page.Locator(
+            var invalidRequired = await GetVisibleButtonsAsync(page.Locator(
                 "input:required:invalid, textarea:required:invalid, select:required:invalid, " +
-                "[aria-required='true']:invalid");
-            if (await invalidRequired.CountAsync() > 0)
+                "[aria-required='true']:invalid"));
+            if (invalidRequired.Count > 0)
             {
-                Console.WriteLine($"  {await invalidRequired.CountAsync()} required field(s) still need your input.");
+                Console.WriteLine($"  {invalidRequired.Count} required field(s) still need your input.");
                 return false;
             }
 
@@ -1013,7 +1259,7 @@ internal static class Program
             }
 
             ILocator? saveAndNext = null;
-            for (var lookupAttempt = 0; lookupAttempt < 10; lookupAttempt++)
+            for (var lookupAttempt = 0; lookupAttempt < 40; lookupAttempt++)
             {
                 await ScrollPageToBottomAsync(page);
                 var buttons = await GetVisibleButtonsAsync(
@@ -1028,7 +1274,18 @@ internal static class Program
                     saveAndNext = buttons[0];
                     break;
                 }
-                await page.WaitForTimeoutAsync(300);
+                var applyEarly = await GetVisibleButtonsAsync(
+                    page.GetByRole(AriaRole.Button, new() { Name = "Apply to job" }));
+                if (applyEarly.Count == 1)
+                {
+                    section = 4;
+                    break;
+                }
+                await page.WaitForTimeoutAsync(500);
+            }
+            if (section >= 4)
+            {
+                break;
             }
 
             if (saveAndNext is null)
@@ -1119,7 +1376,7 @@ internal static class Program
         foreach (var label in labels)
         {
             var buttons = await GetVisibleButtonsAsync(
-                scope.GetByRole(AriaRole.Button, new() { Name = label, Exact = true }));
+                scope.GetByRole(AriaRole.Button, new() { NameRegex = new Regex($@"^\s*{Regex.Escape(label)}\s*$", RegexOptions.IgnoreCase) }));
             matches.AddRange(buttons);
         }
         return matches.Count == 1 ? matches[0] : null;
@@ -1136,17 +1393,36 @@ internal static class Program
         var labels = new[] { "Accept all cookies", "Accept all", "Accept cookies", "Accept", "OK", "Ok", "Okay", "I agree" };
         for (var attempt = 0; attempt < 5; attempt++)
         {
-            foreach (var label in labels)
+            if (page.IsClosed)
             {
-                var buttons = await GetVisibleButtonsAsync(
-                    page.GetByRole(AriaRole.Button, new() { Name = label, Exact = true }));
-                if (buttons.Count == 1)
+                return;
+            }
+
+            try
+            {
+                foreach (var label in labels)
                 {
-                    await buttons[0].ClickAsync();
-                    Console.WriteLine($"  Accepted the cookie banner using '{label}'.");
-                    return;
+                    var buttons = await GetVisibleButtonsAsync(
+                        page.GetByRole(AriaRole.Button, new() { Name = label, Exact = true }));
+                    if (buttons.Count == 1)
+                    {
+                        await buttons[0].ClickAsync();
+                        Console.WriteLine($"  Accepted the cookie banner using '{label}'.");
+                        return;
+                    }
                 }
             }
+            catch (PlaywrightException ex) when (ex.Message.Contains("Execution context was destroyed", StringComparison.OrdinalIgnoreCase) ||
+                                                 ex.Message.Contains("navigation", StringComparison.OrdinalIgnoreCase))
+            {
+                await page.WaitForTimeoutAsync(600);
+                continue;
+            }
+            catch (PlaywrightException)
+            {
+                return;
+            }
+
             await page.WaitForTimeoutAsync(300);
         }
     }
@@ -1252,6 +1528,7 @@ internal static class Program
 
     private static async Task<bool> AdvanceResultsPageAsync(IPage page, CancellationToken cancellationToken)
     {
+        await DismissStaleLinkedInDialogsAsync(page);
         var nextButtons = await GetVisibleButtonsAsync(
             page.Locator("button[data-testid='pagination-controls-next-button-visible']"));
         if (nextButtons.Count != 1 || !await nextButtons[0].IsEnabledAsync())
@@ -1264,7 +1541,8 @@ internal static class Program
             .ToHashSet(StringComparer.Ordinal);
         var previousDetailsJobId = JobListingDiscovery.ExtractCurrentJobId(page.Url);
         Console.WriteLine("  Left pane is at its end; clicking LinkedIn's Next page button.");
-        await nextButtons[0].ClickAsync();
+        await NoTimeoutPlaywright.SafeScrollIntoViewAsync(nextButtons[0]);
+        await nextButtons[0].ClickAsync(new LocatorClickOptions { Force = true });
 
         for (var attempt = 0; attempt < 30; attempt++)
         {
@@ -1289,6 +1567,78 @@ internal static class Program
         return false;
     }
 
+    private static async Task<ILocator?> FindVisibleEasyApplyModalAsync(IPage page)
+    {
+        if (page.IsClosed)
+        {
+            return null;
+        }
+
+        // 1. Standard dialog selectors (pick the last VISIBLE non-messaging dialog).
+        var dialogs = page.Locator("dialog[open], [role='dialog'], [aria-modal='true'], .jobs-easy-apply-modal, .artdeco-modal");
+        for (var i = await dialogs.CountAsync() - 1; i >= 0; i--)
+        {
+            var candidate = dialogs.Nth(i);
+            if (!await candidate.IsVisibleAsync())
+            {
+                continue;
+            }
+            var isMessaging = await candidate.EvaluateAsync<bool>(
+                "el => Boolean(el.closest('.msg-overlay-list-bubble, .msg-overlay-conversation-bubble, aside[id*=\"msg-overlay\"]'))");
+            if (!isMessaging)
+            {
+                return candidate;
+            }
+        }
+
+        // 2. LinkedIn React SDUI Easy Apply modals may render without role="dialog".
+        // Locate the modal container via the visible Dismiss button paired with Easy Apply controls/headings.
+        var foundTagged = await page.EvaluateAsync<bool>(
+            """
+            () => {
+                document.querySelectorAll('[data-job-applicator-modal]').forEach(el => el.removeAttribute('data-job-applicator-modal'));
+                const isVisible = el => {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const clean = t => (t || '').replace(/\s+/g, ' ').trim();
+                const dismissButtons = Array.from(document.querySelectorAll('button')).filter(b => {
+                    if (!isVisible(b)) return false;
+                    const label = clean(b.innerText || b.getAttribute('aria-label') || '');
+                    return /^dismiss$/i.test(label);
+                });
+                for (const btn of dismissButtons) {
+                    let node = btn.parentElement;
+                    for (let depth = 0; node && depth < 12 && node !== document.body; depth++, node = node.parentElement) {
+                        const text = clean(node.innerText || '');
+                        const hasApplyHeading = /\bApply to\b|\bContact info\b|\bReview your application\b|\bApplication sent\b|\b\d+\/\d+\s+pages\b/i.test(text);
+                        const hasActionButton = Array.from(node.querySelectorAll('button')).some(b =>
+                            isVisible(b) && /^(next|review|submit application|done)$/i.test(clean(b.innerText || b.getAttribute('aria-label') || '')));
+                        if (hasApplyHeading && hasActionButton) {
+                            node.setAttribute('data-job-applicator-modal', 'active');
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            """);
+
+        if (foundTagged)
+        {
+            var tagged = page.Locator("[data-job-applicator-modal='active']").First;
+            if (await tagged.CountAsync() > 0 && await tagged.IsVisibleAsync())
+            {
+                return tagged;
+            }
+        }
+
+        return null;
+    }
+
     private static async Task<ApplyResult> CompleteEasyApplyAsync(
         IPage page,
         string jobTitle,
@@ -1301,15 +1651,27 @@ internal static class Program
         string? residenceCityStateZip,
         PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? tailoredResumePdfPath = null)
     {
-        var modal = page.Locator("[role='dialog'], .jobs-easy-apply-modal").Last;
-        if (await modal.CountAsync() == 0 || !await modal.IsVisibleAsync())
+        ILocator? modal = null;
+        for (var wait = 0; wait < 10; wait++)
+        {
+            modal = await FindVisibleEasyApplyModalAsync(page);
+            if (modal is not null)
+            {
+                break;
+            }
+            await page.WaitForTimeoutAsync(250);
+        }
+        if (modal is null)
         {
             return ApplyResult.UnsupportedDialog;
         }
 
         var reviewReached = false;
+        string? previousStepSignature = null;
+        var repeatedStepCount = 0;
         for (var step = 0; step < 8; step++)
         {
             var modalText = await modal.InnerTextAsync();
@@ -1317,6 +1679,35 @@ internal static class Program
             {
                 await CloseCompletedModalAsync(modal, page);
                 return ApplyResult.Submitted;
+            }
+
+            var currentStepSignature = Regex.Replace(modalText, @"\s+", " ").Trim();
+            if (string.Equals(currentStepSignature, previousStepSignature, StringComparison.Ordinal))
+            {
+                repeatedStepCount++;
+                var validationErrors = await modal.EvaluateAsync<string[]>(
+                    """
+                    el => Array.from(el.querySelectorAll('[role="alert"], .artdeco-inline-feedback--error, [class*="error-message" i], [class*="feedback--error" i]'))
+                        .map(n => (n.innerText || '').trim())
+                        .filter(Boolean)
+                    """);
+                if (validationErrors.Length > 0)
+                {
+                    Console.WriteLine($"  LinkedIn Easy Apply validation error prevented advancing: {string.Join(" | ", validationErrors.Distinct())}");
+                }
+                else
+                {
+                    Console.WriteLine("  LinkedIn Easy Apply did not advance to a new step after clicking Next/Review.");
+                }
+                if (repeatedStepCount >= 2)
+                {
+                    return ApplyResult.UnsupportedDialog;
+                }
+            }
+            else
+            {
+                previousStepSignature = currentStepSignature;
+                repeatedStepCount = 0;
             }
 
             if (Regex.IsMatch(modalText, @"\breview (your )?application\b", RegexOptions.IgnoreCase))
@@ -1356,7 +1747,22 @@ internal static class Program
                     }
 
                     var optionLabel = input.Locator("xpath=ancestor::label[1]");
-                    if (await optionLabel.CountAsync() == 0 || !await optionLabel.IsVisibleAsync())
+                    var visibleViaLabel = await optionLabel.CountAsync() > 0 && await optionLabel.IsVisibleAsync();
+                    if (!visibleViaLabel)
+                    {
+                        var inputId = await input.GetAttributeAsync("id");
+                        if (!string.IsNullOrWhiteSpace(inputId))
+                        {
+                            var forLabel = modal.Locator($"label[for={JsonSerializer.Serialize(inputId)}]");
+                            visibleViaLabel = await forLabel.CountAsync() > 0 && await forLabel.First.IsVisibleAsync();
+                        }
+                    }
+                    if (!visibleViaLabel && type == "radio")
+                    {
+                        var radioGroup = input.Locator("xpath=ancestor::*[self::fieldset or @role='radiogroup'][1]");
+                        visibleViaLabel = await radioGroup.CountAsync() > 0 && await radioGroup.First.IsVisibleAsync();
+                    }
+                    if (!visibleViaLabel)
                     {
                         continue;
                     }
@@ -1387,6 +1793,10 @@ internal static class Program
                     continue;
                 }
 
+                if (type == "file" && resumeFlow && !string.IsNullOrWhiteSpace(tailoredResumePdfPath) && File.Exists(tailoredResumePdfPath))
+                {
+                    continue;
+                }
                 if (type is "file" or "password")
                 {
                     unsupportedInput = true;
@@ -1483,7 +1893,21 @@ internal static class Program
 
             if (resumeFlow)
             {
-                if (!await SelectNewestResumeAsync(modal))
+                string? uploadedFileName = null;
+                if (!string.IsNullOrWhiteSpace(tailoredResumePdfPath) && File.Exists(tailoredResumePdfPath))
+                {
+                    var uploadedCount = await ResumeUploadAssistant.UploadResumeAsync(
+                        modal,
+                        cancellationToken,
+                        tailoredResumePdfPath,
+                        replaceExisting: true);
+                    if (uploadedCount > 0)
+                    {
+                        uploadedFileName = Path.GetFileName(tailoredResumePdfPath);
+                        await page.WaitForTimeoutAsync(1500);
+                    }
+                }
+                if (!await SelectNewestResumeAsync(modal, uploadedFileName))
                 {
                     await CloseModalAsync(modal, page);
                     return ApplyResult.UnsupportedDialog;
@@ -1574,9 +1998,11 @@ internal static class Program
                         element => {
                             const text = node => (node?.innerText || node?.textContent || '').trim();
                             if (element.type === 'radio') {
-                                const group = element.closest('fieldset, [role="group"]');
+                                const group = element.closest('fieldset, [role="radiogroup"], [role="group"]');
                                 const legend = group?.querySelector('legend');
                                 if (text(legend)) return text(legend);
+                                const aria = (element.getAttribute('aria-label') || '').trim();
+                                if (aria && !/^(yes|no)$/i.test(aria)) return aria;
                                 if (text(group)) return text(group);
                             }
 
@@ -1742,6 +2168,12 @@ internal static class Program
 
                     var forceManualAnswer = suggestion.Answer is null;
                     var preserveBrowserAnswer = browserAnswer is not null;
+                    if (preserveBrowserAnswer && Console.IsInputRedirected)
+                    {
+                        Console.WriteLine($"Preserving pre-filled LinkedIn answer for \"{field.Question}\": {browserAnswer}");
+                        return true;
+                    }
+
                     while (true)
                     {
                         string answer;
@@ -1990,14 +2422,37 @@ internal static class Program
                         }
                         else
                         {
+                            var radioId = await radio.GetAttributeAsync("id");
+                            ILocator? clickTarget = null;
                             var label = radio.Locator("xpath=ancestor::label[1]");
                             if (await label.CountAsync() > 0 && await label.IsVisibleAsync())
                             {
-                                await label.ClickAsync();
+                                clickTarget = label;
+                            }
+                            else if (!string.IsNullOrWhiteSpace(radioId))
+                            {
+                                var forLabel = radio.Page.Locator($"label[for={JsonSerializer.Serialize(radioId)}]");
+                                if (await forLabel.CountAsync() > 0 && await forLabel.First.IsVisibleAsync())
+                                {
+                                    clickTarget = forLabel.First;
+                                }
+                            }
+                            if (clickTarget is null)
+                            {
+                                var parent = radio.Locator("xpath=..");
+                                if (await parent.CountAsync() > 0 && await parent.IsVisibleAsync())
+                                {
+                                    clickTarget = parent;
+                                }
+                            }
+
+                            if (clickTarget is not null)
+                            {
+                                await clickTarget.ClickAsync();
                             }
                             else
                             {
-                                return false;
+                                await radio.CheckAsync(new LocatorCheckOptions { Force = true });
                             }
                         }
 
@@ -2125,7 +2580,7 @@ internal static class Program
         return ApplyResult.UnsupportedDialog;
     }
 
-    private static async Task<bool> SelectNewestResumeAsync(ILocator modal)
+    private static async Task<bool> SelectNewestResumeAsync(ILocator modal, string? preferredFileName = null)
     {
         var radios = modal.Locator("input[type='radio']");
         var count = await radios.CountAsync();
@@ -2135,12 +2590,21 @@ internal static class Program
         }
 
         var chosenIndex = 0;
+        var matchedPreferred = false;
         DateTime newestDate = DateTime.MinValue;
         var allResumesHaveDates = true;
         for (var i = 0; i < count; i++)
         {
             var radio = radios.Nth(i);
             var text = await ReadControlLabelAsync(radio);
+
+            if (!string.IsNullOrWhiteSpace(preferredFileName) &&
+                text.Contains(preferredFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                chosenIndex = i;
+                matchedPreferred = true;
+                break;
+            }
 
             if (!TryGetResumeDate(text, out var date))
             {
@@ -2153,7 +2617,7 @@ internal static class Program
             }
         }
 
-        if (!allResumesHaveDates)
+        if (!matchedPreferred && !allResumesHaveDates)
         {
             chosenIndex = 0;
         }
@@ -2196,15 +2660,14 @@ internal static class Program
             return ApplyResult.ManualReviewPending;
         }
 
-        var deadline = DateTime.UtcNow.AddSeconds(30);
-        while (DateTime.UtcNow < deadline)
+        for (var check = 0; check < 20; check++)
         {
             if (page.IsClosed)
             {
                 return ApplyResult.ManualReviewPending;
             }
 
-            var bodyText = await page.Locator("body").InnerTextAsync();
+            var bodyText = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
             var modalConfirms = await modal.IsVisibleAsync() &&
                 ContainsConfirmation(await modal.InnerTextAsync());
             if (modalConfirms || ContainsConfirmation(bodyText))
@@ -2220,19 +2683,39 @@ internal static class Program
         return ApplyResult.ManualReviewPending;
     }
 
+    private static async Task DismissStaleLinkedInDialogsAsync(IPage page)
+    {
+        if (page.IsClosed)
+        {
+            return;
+        }
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var visibleDialog = await FindVisibleEasyApplyModalAsync(page);
+            if (visibleDialog is null)
+            {
+                return;
+            }
+
+            await CloseModalAsync(visibleDialog, page);
+            await page.WaitForTimeoutAsync(250);
+        }
+    }
+
     private static async Task CloseModalAsync(ILocator modal, IPage page)
     {
-        var dismiss = modal.GetByRole(AriaRole.Button, new() { Name = "Dismiss" });
+        var dismiss = modal.Locator("button.artdeco-modal__dismiss, button[aria-label*='Dismiss' i], button[aria-label*='Close' i]");
         if (await dismiss.CountAsync() > 0 && await dismiss.First.IsVisibleAsync())
         {
-            await dismiss.First.ClickAsync();
+            await dismiss.First.ClickAsync(new LocatorClickOptions { Force = true });
         }
         else
         {
-            var close = modal.GetByRole(AriaRole.Button, new() { Name = "Close" });
-            if (await close.CountAsync() > 0 && await close.First.IsVisibleAsync())
+            var dismissByRole = modal.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*(Dismiss|Close)\s*$", RegexOptions.IgnoreCase) });
+            if (await dismissByRole.CountAsync() > 0 && await dismissByRole.First.IsVisibleAsync())
             {
-                await close.First.ClickAsync();
+                await dismissByRole.First.ClickAsync(new LocatorClickOptions { Force = true });
             }
             else
             {
@@ -2240,14 +2723,19 @@ internal static class Program
             }
         }
 
-        await page.WaitForTimeoutAsync(250);
-        var remainingDialog = page.GetByRole(AriaRole.Dialog).Last;
-        if (await remainingDialog.CountAsync() > 0 && await remainingDialog.IsVisibleAsync())
+        for (var wait = 0; wait < 6; wait++)
         {
-            var discard = remainingDialog.GetByRole(AriaRole.Button, new() { Name = "Discard", Exact = true });
-            if (await discard.CountAsync() > 0 && await discard.IsVisibleAsync())
+            await page.WaitForTimeoutAsync(250);
+            var discard = page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*Discard\s*$", RegexOptions.IgnoreCase) });
+            if (await discard.CountAsync() > 0 && await discard.First.IsVisibleAsync())
             {
-                await discard.ClickAsync();
+                await discard.First.ClickAsync(new LocatorClickOptions { Force = true });
+                await page.WaitForTimeoutAsync(250);
+                break;
+            }
+            if (!await modal.IsVisibleAsync())
+            {
+                break;
             }
         }
     }

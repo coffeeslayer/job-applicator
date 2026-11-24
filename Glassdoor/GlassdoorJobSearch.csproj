@@ -10,6 +10,8 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\Shared\PersonalProfile.cs" Link="PersonalProfile.cs" />
+    <Compile Include="..\Shared\RunnerLearning.cs" Link="RunnerLearning.cs" />
+    <Compile Include="..\Shared\ResumeTailor.cs" Link="ResumeTailor.cs" />
     <Compile Include="..\LinkedIn\AnswerAssistant.cs" Link="AnswerAssistant.cs" />
     <Compile Include="..\LinkedIn\LocalModelAnswerAssistant.cs" Link="LocalModelAnswerAssistant.cs" />
   </ItemGroup>

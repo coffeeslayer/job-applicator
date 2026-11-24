@@ -35,11 +35,19 @@ internal static class Program
         Console.CancelKeyPress += cancelHandler;
 
         LocalModelAnswerClient? localModel = null;
+        ResumeTailorService? resumeTailor = null;
+        ConsoleLogTee? logTee = null;
+        IPlaywright? playwright = null;
         IBrowserContext? context = null;
+        TaskCompletionSource? browserClosed = null;
+        var keepOpenReason = "Dice runner finished.";
+        string? repositoryRoot = null;
+        IPage? activePage = null;
         try
         {
             var personalProfilePath = PersonalProfile.FindPath(Environment.CurrentDirectory, AppContext.BaseDirectory);
-            var repositoryRoot = Path.GetDirectoryName(personalProfilePath)!;
+            repositoryRoot = Path.GetDirectoryName(personalProfilePath)!;
+            logTee = ConsoleLogTee.Attach(repositoryRoot, "Dice");
             var diceDirectory = Path.Combine(repositoryRoot, "Dice");
             var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
             var resumePath = Path.Combine(repositoryRoot, "resume.md");
@@ -56,7 +64,8 @@ internal static class Program
 
             Directory.CreateDirectory(browserProfilePath);
             Console.WriteLine($"Opening the dedicated Dice Chrome profile at {browserProfilePath}...");
-            using var playwright = await Playwright.CreateAsync();
+            playwright = await Playwright.CreateAsync();
+            resumeTailor = await ResumeTailorService.CreateAsync(repositoryRoot, personalProfile, playwright);
             context = await playwright.Chromium.LaunchPersistentContextAsync(
                 browserProfilePath,
                 new BrowserTypeLaunchPersistentContextOptions
@@ -65,42 +74,49 @@ internal static class Program
                     Headless = false,
                     Args = ["--start-maximized"],
                     ViewportSize = ViewportSize.NoViewport,
-                    Timeout = 30_000
+                    Timeout = 0
                 });
+            NoTimeoutPlaywright.Configure(context);
+            browserClosed = NoTimeoutPlaywright.TrackBrowserClose(context);
 
             var page = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+            NoTimeoutPlaywright.Configure(page);
+            activePage = page;
+            await page.BringToFrontAsync();
             Console.WriteLine($"Navigating to {SearchUrl}");
             await page.GotoAsync(SearchUrl, new PageGotoOptions
             {
                 WaitUntil = WaitUntilState.DOMContentLoaded,
-                Timeout = 60_000
+                Timeout = 0
             });
             await AcceptCookiesIfPresentAsync(page);
-            await WaitForSearchResultsAsync(page, cancellation.Token);
+            await WaitForSearchResultsAsync(page, repositoryRoot, cancellation.Token);
             Console.WriteLine($"Dice search results loaded: {page.Url}");
 
-            await WaitForSignInAsync(page, TimeSpan.FromMinutes(5), cancellation.Token);
+            await WaitForSignInAsync(page, repositoryRoot, cancellation.Token);
             if (!page.Url.StartsWith("https://www.dice.com/jobs", StringComparison.OrdinalIgnoreCase))
             {
                 await page.GotoAsync(SearchUrl, new PageGotoOptions
                 {
                     WaitUntil = WaitUntilState.DOMContentLoaded,
-                    Timeout = 60_000
+                    Timeout = 0
                 });
-                await WaitForSearchResultsAsync(page, cancellation.Token);
+                await WaitForSearchResultsAsync(page, repositoryRoot, cancellation.Token);
             }
 
+            var skippedThisRun = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var jobs = await FindJobsAsync(page);
-            var pending = FilterPendingJobs(jobs, appliedJobs);
+            var pending = FilterPendingJobs(jobs, appliedJobs, skippedThisRun);
             Console.WriteLine($"Dice reports {jobs.Count} matching results.");
             foreach (var job in jobs)
             {
-                Console.WriteLine($"- {job.Id}: {(pending.Any(item => item.Id == job.Id) ? "ready" : "already processed")}");
+                Console.WriteLine($"- {job.Id}: {(pending.Any(item => item.Id == job.Id) ? "ready" : "already processed")} ({job.Title})");
             }
 
             if (jobs.Count == 0)
             {
-                Console.WriteLine("No matching job listings loaded; no applications will be submitted.");
+                keepOpenReason = "No matching job listings loaded; no applications will be submitted.";
+                Console.WriteLine(keepOpenReason);
                 return 0;
             }
 
@@ -109,12 +125,23 @@ internal static class Program
             while (pending.Count > 0)
             {
                 cancellation.Token.ThrowIfCancellationRequested();
+                if (page.IsClosed)
+                {
+                    keepOpenReason = "Dice Chrome page was closed.";
+                    Console.WriteLine(keepOpenReason);
+                    return 0;
+                }
+
                 var job = pending[0];
                 Console.WriteLine($"\nApplying to Dice listing {job.Id}: {job.Title}");
-                if (!await ApplyToJobAsync(page, job, personalProfile, localModel, resumeText, cancellation.Token))
+                if (!await ApplyToJobAsync(page, job, personalProfile, localModel, resumeTailor, resumeText, repositoryRoot, cancellation.Token))
                 {
+                    skippedThisRun.Add(job.Id);
                     pending.RemoveAt(0);
-                    await ReturnToSearchAsync(page, cancellation.Token);
+                    if (!page.IsClosed)
+                    {
+                        await ReturnToSearchAsync(page, repositoryRoot, cancellation.Token);
+                    }
                     continue;
                 }
 
@@ -122,40 +149,43 @@ internal static class Program
                 await SaveAppliedJobsAsync(statePath, appliedJobs);
                 appliedThisRun++;
                 Console.WriteLine("Dice showed the success screen; application recorded locally.");
-                await ReturnToSearchAsync(page, cancellation.Token);
+                await ReturnToSearchAsync(page, repositoryRoot, cancellation.Token);
                 jobs = await FindJobsAsync(page);
-                pending = FilterPendingJobs(jobs, appliedJobs);
+                pending = FilterPendingJobs(jobs, appliedJobs, skippedThisRun);
             }
 
-            Console.WriteLine($"\nFinished. Submitted {appliedThisRun} application(s) in this run.");
-            Console.WriteLine("Press Enter to close the browser and exit.");
-            await Console.In.ReadLineAsync();
+            keepOpenReason = $"Finished. Submitted {appliedThisRun} application(s) in this run.";
+            Console.WriteLine($"\n{keepOpenReason}");
             return 0;
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("Run cancelled.");
+            keepOpenReason = "Run cancelled.";
+            Console.WriteLine(keepOpenReason);
             return 0;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("Dice runner failed with an exception:");
             Console.Error.WriteLine(ex.ToString());
-            if (context is not null)
+            if (!string.IsNullOrWhiteSpace(repositoryRoot))
             {
-                Console.WriteLine("Chromium is being kept open for troubleshooting. Press Enter after inspecting it to close the browser and exit.");
-                await Console.In.ReadLineAsync();
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(activePage, repositoryRoot, "Dice", $"Unhandled exception: {ex.Message}");
             }
+            keepOpenReason = "Dice runner stopped after an error.";
             return 1;
         }
         finally
         {
             Console.CancelKeyPress -= cancelHandler;
-            if (context is not null)
+            await NoTimeoutPlaywright.KeepBrowserOpenUntilClosedAsync(context, browserClosed, keepOpenReason);
+            if (resumeTailor is not null)
             {
-                await context.CloseAsync();
+                await resumeTailor.DisposeAsync();
             }
+            playwright?.Dispose();
             localModel?.Dispose();
+            logTee?.Dispose();
         }
     }
 
@@ -302,26 +332,36 @@ internal static class Program
         return results;
     }
 
-    private static List<JobListing> FilterPendingJobs(IEnumerable<JobListing> jobs, IReadOnlyDictionary<string, AppliedJob> appliedJobs) => jobs
+    private static List<JobListing> FilterPendingJobs(
+        IEnumerable<JobListing> jobs,
+        IReadOnlyDictionary<string, AppliedJob> appliedJobs,
+        IReadOnlySet<string> skippedThisRun) => jobs
         .Where(job => !appliedJobs.ContainsKey(job.Id))
+        .Where(job => !skippedThisRun.Contains(job.Id))
         .Where(job => !ExcludedApplicationUrl.IsMatch(job.Url))
         .Where(job => !Regex.IsMatch(job.CardText, @"\bApplied\b", RegexOptions.IgnoreCase))
         .ToList();
 
-    private static async Task WaitForSearchResultsAsync(IPage page, CancellationToken cancellationToken)
+    private static async Task WaitForSearchResultsAsync(IPage page, string repositoryRoot, CancellationToken cancellationToken)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
-        while (DateTimeOffset.UtcNow < deadline)
+        var started = DateTimeOffset.UtcNow;
+        var loggedDelay = false;
+        while (!page.IsClosed)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (ResultCountPattern.IsMatch(await page.Locator("body").InnerTextAsync()))
+            var bodyText = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
+            if (ResultCountPattern.IsMatch(bodyText))
             {
                 return;
             }
+            if (!loggedDelay && DateTimeOffset.UtcNow - started > TimeSpan.FromSeconds(15))
+            {
+                loggedDelay = true;
+                Console.WriteLine($"Still waiting for Dice search results to load (no timeout). Current page: {page.Url}");
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", "Waiting for search results");
+            }
             await page.WaitForTimeoutAsync(500);
         }
-
-        throw new PlaywrightException($"Dice search results did not load. Current page: {page.Url}");
     }
 
     private static async Task AcceptCookiesIfPresentAsync(IPage page)
@@ -334,7 +374,7 @@ internal static class Program
         {
             try
             {
-                await visible[0].ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+                await visible[0].ClickAsync();
                 Console.WriteLine("Accepted all cookies.");
             }
             catch (PlaywrightException ex)
@@ -348,7 +388,7 @@ internal static class Program
         }
     }
 
-    private static async Task WaitForSignInAsync(IPage page, TimeSpan timeout, CancellationToken cancellationToken)
+    private static async Task WaitForSignInAsync(IPage page, string repositoryRoot, CancellationToken cancellationToken)
     {
         if (!await IsSignedOutAsync(page))
         {
@@ -372,24 +412,32 @@ internal static class Program
             }
         }
 
-        Console.WriteLine("Complete Dice sign-in or any verification in the Chrome window. The runner will continue after sign-in is detected.");
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
+        Console.WriteLine("Complete Dice sign-in or any verification in the Chrome window. No timeout — the runner will continue automatically after sign-in is detected.");
+        var lastReminder = DateTimeOffset.UtcNow;
+        var dumpedDiagnostics = false;
+        while (!page.IsClosed)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (page.IsClosed)
-            {
-                throw new PlaywrightException("The Dice Chrome page was closed before sign-in.");
-            }
-            if (!await IsSignedOutAsync(page) && Uri.TryCreate(page.Url, UriKind.Absolute, out var current) && current.Host.EndsWith("dice.com", StringComparison.OrdinalIgnoreCase))
+            if (!await IsSignedOutAsync(page) &&
+                Uri.TryCreate(page.Url, UriKind.Absolute, out var current) &&
+                current.Host.EndsWith("dice.com", StringComparison.OrdinalIgnoreCase) &&
+                !page.Url.Contains("/dashboard/login", StringComparison.OrdinalIgnoreCase))
             {
                 Console.WriteLine("Dice sign-in detected; continuing.");
                 return;
             }
+            if (DateTimeOffset.UtcNow - lastReminder > TimeSpan.FromSeconds(30))
+            {
+                lastReminder = DateTimeOffset.UtcNow;
+                Console.WriteLine($"Still waiting for Dice sign-in in Chrome (no timeout). Current page: {page.Url}");
+                if (!dumpedDiagnostics)
+                {
+                    dumpedDiagnostics = true;
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", "Waiting for Dice sign-in");
+                }
+            }
             await page.WaitForTimeoutAsync(1000);
         }
-
-        throw new PlaywrightException("Dice sign-in was not detected within five minutes. Sign in in Chrome and rerun the command.");
     }
 
     private static async Task<bool> IsSignedOutAsync(IPage page)
@@ -417,7 +465,7 @@ internal static class Program
         Console.WriteLine("Signing in to Dice with credentials from .env...");
         if (!page.Url.StartsWith("https://www.dice.com/dashboard/login", StringComparison.OrdinalIgnoreCase))
         {
-            await page.GotoAsync("https://www.dice.com/dashboard/login", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+            await page.GotoAsync("https://www.dice.com/dashboard/login", new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
         }
 
         // If Dice redirected away from the login page (e.g. to /home-feed), the session
@@ -429,25 +477,40 @@ internal static class Program
         }
 
         var emailField = page.Locator("input[type='email']").First;
-        try
+        var waitStart = DateTimeOffset.UtcNow;
+        while (!page.IsClosed && DateTimeOffset.UtcNow - waitStart < TimeSpan.FromSeconds(20))
         {
-            await emailField.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Visible, Timeout = 20_000 });
-            await emailField.FillAsync(email);
-            await page.GetByRole(AriaRole.Button, new() { Name = "Continue with email", Exact = true }).ClickAsync();
-        }
-        catch (PlaywrightException ex)
-        {
-            throw new PlaywrightException($"Dice's email sign-in form was not available. No credentials were submitted. ({ex.Message})");
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!page.Url.Contains("/dashboard/login", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"Dice redirected to {page.Url} — session is active.");
+                return;
+            }
+            if (await emailField.IsVisibleAsync())
+            {
+                break;
+            }
+            await page.WaitForTimeoutAsync(300);
         }
 
+        if (!await emailField.IsVisibleAsync())
+        {
+            Console.WriteLine("Dice's email sign-in form did not appear yet; leaving Chrome open for manual sign-in.");
+            return;
+        }
+
+        await emailField.FillAsync(email);
+        await page.GetByRole(AriaRole.Button, new() { Name = "Continue with email", Exact = true }).ClickAsync();
+
         var passwordField = page.Locator("input[type='password'][autocomplete='current-password'], input[type='password'][name='password']").First;
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(20);
-        while (DateTimeOffset.UtcNow < deadline)
+        var passwordWaitStart = DateTimeOffset.UtcNow;
+        while (!page.IsClosed && DateTimeOffset.UtcNow - passwordWaitStart < TimeSpan.FromSeconds(20))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (await page.Locator("input[name='firstName'], input[name='confirmPassword']").CountAsync() > 0)
             {
-                throw new PlaywrightException("Dice showed account registration instead of sign-in. No registration was submitted; check DICE_EMAIL.");
+                Console.WriteLine("Dice showed account registration instead of sign-in. Complete sign-in manually in Chrome.");
+                return;
             }
             if (await passwordField.IsVisibleAsync())
             {
@@ -470,9 +533,10 @@ internal static class Program
         var buttons = await GetVisibleLocatorsAsync(signInButtons);
         if (buttons.Count != 1)
         {
-            throw new PlaywrightException("Dice's password sign-in button was not unique. The password was entered but not submitted.");
+            Console.WriteLine("Dice's password sign-in button was not unique. Complete sign-in manually in Chrome.");
+            return;
         }
-        await buttons[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+        await buttons[0].ClickAsync();
         Console.WriteLine("Dice sign-in submitted. Waiting for the account session or additional verification in Chrome...");
     }
 
@@ -481,202 +545,410 @@ internal static class Program
         JobListing job,
         PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
+        ResumeTailorService? resumeTailor,
         string resumeText,
+        string repositoryRoot,
         CancellationToken cancellationToken)
     {
-        await page.GotoAsync(job.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+        await page.GotoAsync(job.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
         if (ExcludedApplicationUrl.IsMatch(page.Url))
         {
             Console.WriteLine($"Skipping excluded application URL: {page.Url}");
             return false;
         }
 
-        // The page navigates with DOMContentLoaded but the apply button is rendered by React.
-        // Wait up to 10 s for it to appear before querying visibility.
+        // Wait for React to hydrate either the Easy Apply button or an Applied indicator.
         var applyAction = page.Locator("[data-testid='apply-button']");
-        try
+        var hydrationStart = DateTimeOffset.UtcNow;
+        List<ILocator> visibleApplyActions = [];
+        while (!page.IsClosed && DateTimeOffset.UtcNow - hydrationStart < TimeSpan.FromSeconds(12))
         {
-            await applyAction.First.WaitForAsync(new LocatorWaitForOptions
+            cancellationToken.ThrowIfCancellationRequested();
+            visibleApplyActions = await GetVisibleLocatorsAsync(applyAction);
+            if (visibleApplyActions.Count > 0)
             {
-                State = WaitForSelectorState.Visible,
-                Timeout = 10_000
-            });
+                break;
+            }
+            var body = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
+            if (Regex.IsMatch(body, @"\bApplication Submitted\b|\bYou(?:'ve| have) applied\b", RegexOptions.IgnoreCase))
+            {
+                Console.WriteLine($"Listing already marked as applied on Dice ({job.Url}); skipping.");
+                return false;
+            }
+            await page.WaitForTimeoutAsync(300);
         }
-        catch (TimeoutException)
+
+        if (visibleApplyActions.Count == 0)
         {
-            Console.WriteLine($"No Easy Apply button appeared for {job.Url}; skipping (listing may not support Easy Apply).");
+            Console.WriteLine($"No Easy Apply button appeared for {job.Url}; dumping diagnostics and skipping.");
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"No Easy Apply button on {job.Title}");
             return false;
         }
 
-        var visibleApplyActions = await GetVisibleLocatorsAsync(applyAction);
-        if (visibleApplyActions.Count == 0)
+        var applyText = Regex.Replace(await visibleApplyActions[0].InnerTextAsync(), @"\s+", " ").Trim();
+        if (applyText.Contains("Applied", StringComparison.OrdinalIgnoreCase) || await visibleApplyActions[0].IsDisabledAsync())
         {
-            Console.WriteLine($"No Easy Apply button found for {job.Url}; skipping.");
+            Console.WriteLine($"Apply button shows '{applyText}' (disabled or already applied) for {job.Url}; skipping.");
             return false;
         }
+
         if (visibleApplyActions.Count > 1)
         {
             Console.WriteLine($"Found {visibleApplyActions.Count} Apply buttons for {job.Url}; using the first one.");
         }
-        await visibleApplyActions[0].ClickAsync(new LocatorClickOptions { Timeout = 20_000 });
-        await ClickUniqueButtonAsync(page, "Next", cancellationToken);
-        await ClickSubmitOrAnswerQuestionsAsync(page, job.Title, personalProfile, localModel, resumeText, cancellationToken);
-        await WaitForApplicationSuccessAsync(page, cancellationToken);
-        return true;
+
+        TailoredResumeArtifact? tailoredResume = null;
+        if (resumeTailor is not null)
+        {
+            var (jdText, company) = await JobDescriptionExtractor.ExtractFromPageAsync(page, "Dice", job.Title);
+            tailoredResume = await resumeTailor.TailorForJobAsync(
+                new JobTailoringContext("Dice", job.Title, company, page.Url, jdText),
+                cancellationToken);
+        }
+
+        var effectiveResumeText = tailoredResume?.MarkdownText ?? resumeText;
+        Console.WriteLine($"Clicking '{applyText}'...");
+        await visibleApplyActions[0].ClickAsync();
+        await ClickSubmitOrAnswerQuestionsAsync(page, job, personalProfile, localModel, effectiveResumeText, repositoryRoot, cancellationToken, tailoredResume?.PdfPath);
+        return await WaitForApplicationSuccessAsync(page, job, repositoryRoot, cancellationToken);
     }
 
     private static async Task ClickSubmitOrAnswerQuestionsAsync(
         IPage page,
-        string jobTitle,
+        JobListing job,
         PersonalProfile? personalProfile,
         LocalModelAnswerClient? localModel,
         string resumeText,
-        CancellationToken cancellationToken)
+        string repositoryRoot,
+        CancellationToken cancellationToken,
+        string? tailoredResumePdfPath = null)
     {
-        for (var step = 0; step < 8; step++)
+        var diceReplaceAttempted = false;
+        for (var step = 0; step < 12; step++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var (submitButtons, nextButtons) = await WaitForWizardActionsAsync(page, cancellationToken);
+            if (page.IsClosed)
+            {
+                return;
+            }
+
+            if (await IsApplicationSuccessAsync(page))
+            {
+                return;
+            }
+
+            var (submitButtons, nextButtons) = await WaitForWizardActionsAsync(page, job.Title, repositoryRoot, cancellationToken);
+            if (page.IsClosed || await IsApplicationSuccessAsync(page))
+            {
+                return;
+            }
+
+            if (!diceReplaceAttempted &&
+                !string.IsNullOrWhiteSpace(tailoredResumePdfPath) &&
+                File.Exists(tailoredResumePdfPath))
+            {
+                diceReplaceAttempted = await TryUploadDiceTailoredResumeAsync(page, tailoredResumePdfPath, cancellationToken);
+            }
+
+            // Always draft/fill any blank fields on the current wizard step BEFORE clicking Next or Submit.
+            var draft = await ExternalApplicationFormAssistant.DraftBlankFieldsAsync(
+                page,
+                localModel,
+                job.Title,
+                resumeText,
+                personalProfile?.Residence,
+                cancellationToken,
+                personalProfile,
+                tailoredResumePdfPath);
+            if (draft.FilledCount > 0)
+            {
+                Console.WriteLine($"  Step {step + 1}: filled {draft.FilledCount} Dice field(s) from personal.md or resume-grounded local drafts.");
+            }
+
+            if (draft.UnansweredQuestions.Count > 0)
+            {
+                Console.WriteLine($"  Step {step + 1}: unanswered or ambiguous questions on {page.Url}:");
+                foreach (var question in draft.UnansweredQuestions)
+                {
+                    Console.WriteLine($"    - {question}");
+                }
+                await InteractiveBlockerResolver.WritePendingQuestionsAsync(repositoryRoot, "Dice", job.Title, job.Url, draft.UnansweredQuestions);
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(
+                    page,
+                    repositoryRoot,
+                    "Dice",
+                    $"Unanswered questions on step {step + 1} for {job.Title}",
+                    draft.UnansweredQuestions);
+                await WaitForManualInputOrProgressAsync(page, cancellationToken);
+                if (page.IsClosed || await IsApplicationSuccessAsync(page))
+                {
+                    return;
+                }
+                continue;
+            }
+
+            // Re-query buttons after filling fields (filling fields can enable Submit/Next or change state).
+            (submitButtons, nextButtons) = await GetWizardActionsAsync(page);
             if (submitButtons.Count > 1)
             {
-                throw new PlaywrightException("Several Submit buttons are visible; stopping without guessing.");
+                Console.WriteLine($"  Step {step + 1}: several Submit buttons ({submitButtons.Count}) are visible; waiting for manual guidance.");
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Multiple Submit buttons on {job.Title}");
+                await WaitForManualInputOrProgressAsync(page, cancellationToken);
+                continue;
+            }
+
+            var visibleInvalidRequired = await GetVisibleInvalidRequiredFieldsAsync(page);
+            if (visibleInvalidRequired.Count > 0)
+            {
+                Console.WriteLine($"  Step {step + 1}: {visibleInvalidRequired.Count} required field(s) are still incomplete or invalid.");
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Invalid required fields on step {step + 1} for {job.Title}");
+                await WaitForManualInputOrProgressAsync(page, cancellationToken);
+                if (page.IsClosed || await IsApplicationSuccessAsync(page))
+                {
+                    return;
+                }
+                continue;
             }
 
             if (submitButtons.Count == 1)
             {
-                var invalidRequiredFields = page.Locator(
-                    "input:required:invalid, textarea:required:invalid, select:required:invalid, [aria-required='true'][aria-invalid='true']");
-                if (await invalidRequiredFields.CountAsync() == 0)
+                if (await submitButtons[0].IsDisabledAsync())
                 {
-                    await submitButtons[0].ClickAsync();
-                    return;
+                    Console.WriteLine($"  Step {step + 1}: Submit button is disabled; dumping diagnostics and waiting for manual resolution.");
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Disabled Submit button on {job.Title}");
+                    await WaitForManualInputOrProgressAsync(page, cancellationToken);
+                    continue;
                 }
 
-                Console.WriteLine("Required application fields are still incomplete. Complete them in Chrome before continuing.");
-                await WaitForManualInputAsync(cancellationToken);
+                Console.WriteLine($"  Step {step + 1}: clicking Submit...");
+                await submitButtons[0].ClickAsync();
+                await page.WaitForTimeoutAsync(800);
+                return;
+            }
+
+            if (nextButtons.Count == 1)
+            {
+                if (await nextButtons[0].IsDisabledAsync())
+                {
+                    Console.WriteLine($"  Step {step + 1}: Next button is disabled; dumping diagnostics and waiting for manual resolution.");
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Disabled Next button on {job.Title}");
+                    await WaitForManualInputOrProgressAsync(page, cancellationToken);
+                    continue;
+                }
+
+                Console.WriteLine($"  Step {step + 1}: clicking Next...");
+                await nextButtons[0].ClickAsync();
+                await page.WaitForTimeoutAsync(600);
                 continue;
             }
 
-            var draft = await ExternalApplicationFormAssistant.DraftBlankFieldsAsync(
-                page,
-                localModel,
-                jobTitle,
-                resumeText,
-                personalProfile?.Residence,
-                cancellationToken,
-                personalProfile);
-            if (draft.FilledCount > 0)
+            if (await IsApplicationSuccessAsync(page))
             {
-                Console.WriteLine($"Filled {draft.FilledCount} Dice field(s) from personal.md or resume-grounded local drafts.");
-            }
-            if (draft.UnansweredQuestions.Count > 0)
-            {
-                Console.WriteLine("Answer or review these unsupported or ambiguous questions in Chrome:");
-                foreach (var question in draft.UnansweredQuestions)
-                {
-                    Console.WriteLine($"  - {question}");
-                }
-                await WaitForManualInputAsync(cancellationToken);
+                return;
             }
 
-            if (nextButtons.Count != 1)
-            {
-                throw new PlaywrightException("Dice did not show a unique Next or Submit button after reviewing the application fields.");
-            }
-            await nextButtons[0].ClickAsync();
-            await page.WaitForTimeoutAsync(500);
+            Console.WriteLine($"  Step {step + 1}: Dice did not show a unique Next or Submit button ({nextButtons.Count} Next, {submitButtons.Count} Submit).");
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"No unique Next/Submit button on step {step + 1} for {job.Title}");
+            await WaitForManualInputOrProgressAsync(page, cancellationToken);
         }
 
-        throw new PlaywrightException("Dice did not show a valid Submit button after the application steps.");
+        Console.WriteLine($"Reached maximum wizard steps for {job.Title}; dumping diagnostics and waiting for manual completion.");
+        await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Exceeded wizard steps for {job.Title}");
+        await WaitForManualInputOrProgressAsync(page, cancellationToken);
     }
 
-    private static async Task WaitForManualInputAsync(CancellationToken cancellationToken)
+    private static async Task<List<ILocator>> GetVisibleInvalidRequiredFieldsAsync(IPage page)
     {
-        Console.WriteLine("Complete the fields in Chrome, then press Enter here to continue (Ctrl+C cancels).");
-        if (await Console.In.ReadLineAsync(cancellationToken) is null)
+        var invalid = page.Locator(
+            "input:required:invalid, textarea:required:invalid, select:required:invalid, [aria-required='true'][aria-invalid='true']");
+        return await GetVisibleLocatorsAsync(invalid);
+    }
+
+    private static async Task WaitForManualInputOrProgressAsync(IPage page, CancellationToken cancellationToken)
+    {
+        if (Console.IsInputRedirected)
         {
-            throw new InvalidDataException("Console input ended before the manual application review was completed.");
+            Console.WriteLine("Waiting in Chrome (non-interactive console, no timeout). Complete the step in Chrome or close Chrome when done.");
+            var startingUrl = page.Url;
+            while (!page.IsClosed)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (await IsApplicationSuccessAsync(page) || !string.Equals(page.Url, startingUrl, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+                await page.WaitForTimeoutAsync(1000);
+            }
+            return;
         }
+
+        Console.WriteLine("Complete the step in Chrome, then press Enter here to continue (no timeout; Ctrl+C cancels).");
+        var readTask = Console.In.ReadLineAsync(cancellationToken).AsTask();
+        while (!readTask.IsCompleted && !page.IsClosed)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (await IsApplicationSuccessAsync(page))
+            {
+                return;
+            }
+            await Task.WhenAny(readTask, Task.Delay(500, cancellationToken));
+        }
+    }
+
+    private static async Task<(List<ILocator> Submit, List<ILocator> Next)> GetWizardActionsAsync(IPage page)
+    {
+        var submit = page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*(Submit|Submit application)\s*$", RegexOptions.IgnoreCase) });
+        var next = page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*(Next|Continue|Review)\s*$", RegexOptions.IgnoreCase) });
+        return (await GetVisibleLocatorsAsync(submit), await GetVisibleLocatorsAsync(next));
     }
 
     private static async Task<(List<ILocator> Submit, List<ILocator> Next)> WaitForWizardActionsAsync(
         IPage page,
+        string jobTitle,
+        string repositoryRoot,
         CancellationToken cancellationToken)
     {
-        var submit = page.GetByRole(AriaRole.Button, new() { Name = "Submit", Exact = true });
-        var next = page.GetByRole(AriaRole.Button, new() { Name = "Next", Exact = true });
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
-        while (true)
+        var started = DateTimeOffset.UtcNow;
+        var dumped = false;
+        while (!page.IsClosed)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var submitButtons = await GetVisibleLocatorsAsync(submit);
-            var nextButtons = await GetVisibleLocatorsAsync(next);
-            if (submitButtons.Count > 0 || nextButtons.Count > 0 || DateTimeOffset.UtcNow >= deadline)
+            if (await IsApplicationSuccessAsync(page))
             {
+                return ([], []);
+            }
+
+            var (submitButtons, nextButtons) = await GetWizardActionsAsync(page);
+            if (submitButtons.Count > 0 || nextButtons.Count > 0)
+            {
+                return (submitButtons, nextButtons);
+            }
+
+            if (!dumped && DateTimeOffset.UtcNow - started > TimeSpan.FromSeconds(15))
+            {
+                dumped = true;
+                Console.WriteLine($"Still waiting for Dice wizard Next/Submit buttons on {page.Url} (no timeout)...");
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Waiting for wizard actions on {jobTitle}");
                 return (submitButtons, nextButtons);
             }
 
             await page.WaitForTimeoutAsync(250);
         }
+
+        return ([], []);
     }
 
-    private static async Task ClickUniqueButtonAsync(IPage page, string name, CancellationToken cancellationToken)
+    private static async Task<bool> IsApplicationSuccessAsync(IPage page)
     {
-        // Easy Apply navigates to the wizard before its buttons render. A count of
-        // zero here is that gap; more than one visible match is still ambiguous.
-        var buttons = page.GetByRole(AriaRole.Button, new() { Name = name, Exact = true });
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
-        while (true)
+        if (page.IsClosed)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var visible = await GetVisibleLocatorsAsync(buttons);
-            if (visible.Count == 1)
-            {
-                await visible[0].ClickAsync(new LocatorClickOptions { Timeout = 20_000 });
-                return;
-            }
-
-            if (visible.Count > 1)
-            {
-                throw new PlaywrightException(
-                    $"Could not find a unique {name} button ({visible.Count} visible). Stopping without retrying. Current page: {page.Url}");
-            }
-
-            if (DateTimeOffset.UtcNow >= deadline)
-            {
-                throw new PlaywrightException(
-                    $"Could not find a unique {name} button (none visible after waiting). Stopping without retrying. Current page: {page.Url}");
-            }
-
-            await page.WaitForTimeoutAsync(250);
+            return false;
         }
+        var successUrl = Regex.IsMatch(page.Url, @"/wizard/success(?:[?#]|$)", RegexOptions.IgnoreCase);
+        if (successUrl)
+        {
+            return true;
+        }
+        var bodyText = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
+        return Regex.IsMatch(bodyText, @"application is on its way|application submitted|thank you for applying", RegexOptions.IgnoreCase);
     }
 
-    private static async Task WaitForApplicationSuccessAsync(IPage page, CancellationToken cancellationToken)
+    private static async Task<bool> WaitForApplicationSuccessAsync(
+        IPage page,
+        JobListing job,
+        string repositoryRoot,
+        CancellationToken cancellationToken)
     {
-        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
-        while (DateTimeOffset.UtcNow < deadline)
+        var started = DateTimeOffset.UtcNow;
+        var dumped = false;
+        while (!page.IsClosed)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var successUrl = Regex.IsMatch(page.Url, @"/wizard/success(?:[?#]|$)", RegexOptions.IgnoreCase);
-            var bodyText = await page.Locator("body").InnerTextAsync();
-            if (successUrl || Regex.IsMatch(bodyText, @"application is on its way", RegexOptions.IgnoreCase))
+            if (await IsApplicationSuccessAsync(page))
             {
-                return;
+                return true;
+            }
+            if (!dumped && DateTimeOffset.UtcNow - started > TimeSpan.FromSeconds(15))
+            {
+                dumped = true;
+                Console.WriteLine($"Still waiting for Dice confirmation screen after Submit on {page.Url} (no timeout).");
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, repositoryRoot, "Dice", $"Waiting for confirmation after Submit on {job.Title}");
             }
             await page.WaitForTimeoutAsync(500);
         }
 
-        throw new PlaywrightException($"Dice did not show an application success page after Submit. Current page: {page.Url}. Check Applied Jobs before retrying.");
+        return false;
     }
 
-    private static async Task ReturnToSearchAsync(IPage page, CancellationToken cancellationToken)
+    private static async Task<bool> TryUploadDiceTailoredResumeAsync(
+        IPage page,
+        string tailoredResumePdfPath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var bodyText = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
+            if (!Regex.IsMatch(bodyText, @"\bresume\b", RegexOptions.IgnoreCase))
+            {
+                return false;
+            }
+
+            var uploaded = await ResumeUploadAssistant.UploadResumeAsync(
+                page.Locator("body"),
+                cancellationToken,
+                tailoredResumePdfPath,
+                replaceExisting: true);
+            if (uploaded > 0)
+            {
+                await page.WaitForTimeoutAsync(800);
+                return true;
+            }
+
+            // Dice often shows a saved profile resume with a "Replace" button that opens a file chooser or reveals a file input.
+            var replaceButtons = await GetVisibleLocatorsAsync(
+                page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^(replace|upload\s+resume|change\s+resume)$", RegexOptions.IgnoreCase) }));
+            if (replaceButtons.Count == 1)
+            {
+                try
+                {
+                    var chooser = await page.RunAndWaitForFileChooserAsync(
+                        async () => await replaceButtons[0].ClickAsync(),
+                        new PageRunAndWaitForFileChooserOptions { Timeout = 3000 });
+                    await chooser.SetFilesAsync(tailoredResumePdfPath);
+                    Console.WriteLine($"  Replaced Dice resume with tailored PDF: {Path.GetFileName(tailoredResumePdfPath)}");
+                    await page.WaitForTimeoutAsync(1000);
+                    return true;
+                }
+                catch (TimeoutException)
+                {
+                    await page.WaitForTimeoutAsync(500);
+                    uploaded = await ResumeUploadAssistant.UploadResumeAsync(
+                        page.Locator("body"),
+                        cancellationToken,
+                        tailoredResumePdfPath,
+                        replaceExisting: true);
+                    if (uploaded > 0)
+                    {
+                        await page.WaitForTimeoutAsync(800);
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (PlaywrightException)
+        {
+        }
+
+        return false;
+    }
+
+    private static async Task ReturnToSearchAsync(IPage page, string repositoryRoot, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Console.WriteLine($"Returning to the filtered search: {SearchUrl}");
-        await page.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
+        await page.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
         await AcceptCookiesIfPresentAsync(page);
-        await WaitForSearchResultsAsync(page, cancellationToken);
+        await WaitForSearchResultsAsync(page, repositoryRoot, cancellationToken);
     }
 
     private static async Task<List<ILocator>> GetVisibleLocatorsAsync(ILocator locator)

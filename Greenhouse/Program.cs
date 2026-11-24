@@ -29,8 +29,7 @@ internal static class Program
         var appliedJobsPath = Path.Combine(dataDirectory, "applied-jobs.json");
         var personalProfilePath = PersonalProfile.FindPath(Environment.CurrentDirectory, AppContext.BaseDirectory);
         var projectRoot = Path.GetDirectoryName(personalProfilePath)!;
-        var teeWriter = new ConsoleTeeWriter(Console.Out, Path.Combine(projectRoot, "console.log"));
-        Console.SetOut(teeWriter);
+        using var logTee = ConsoleLogTee.Attach(projectRoot, "Greenhouse");
         var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
         var resumePath = Path.Combine(projectRoot, "resume.md");
         var resumeText = File.Exists(resumePath) ? await File.ReadAllTextAsync(resumePath) : "";
@@ -70,45 +69,64 @@ internal static class Program
         Console.WriteLine($"Applied jobs are tracked in {appliedJobsPath} ({appliedJobs.Count} recorded).");
         Console.WriteLine("The browser profile is local to your Windows account. Sign in there if Greenhouse asks.");
 
-        using var playwright = await Playwright.CreateAsync();
+        IPlaywright? playwright = null;
         IBrowserContext? context = null;
+        ResumeTailorService? resumeTailor = null;
+        TaskCompletionSource? browserClosed = null;
+        IPage? activePage = null;
+        var keepOpenReason = "Greenhouse runner finished.";
         var keepJobPagesForTroubleshooting = false;
         try
         {
+            playwright = await Playwright.CreateAsync();
+            resumeTailor = await ResumeTailorService.CreateAsync(projectRoot, personalProfile, playwright);
             context = await playwright.Chromium.LaunchPersistentContextAsync(
                 profileDirectory,
-                new BrowserTypeLaunchPersistentContextOptions { Headless = false });
+                new BrowserTypeLaunchPersistentContextOptions { Headless = false, Timeout = 0 });
+            NoTimeoutPlaywright.Configure(context);
+            browserClosed = NoTimeoutPlaywright.TrackBrowserClose(context);
             var searchPage = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
-            await searchPage.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+            NoTimeoutPlaywright.Configure(searchPage);
+            activePage = searchPage;
+            await searchPage.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
             var waitingForVerificationCode = await PrepareGreenhouseSignInAsync(searchPage, personalProfile);
 
             Console.WriteLine();
             Console.WriteLine("Greenhouse search opened with the requested filters:");
             Console.WriteLine("  Posted in the past five days; salary above $160,000; remote;");
             Console.WriteLine("  full-time, part-time, contract, or temporary.");
-            Console.WriteLine(waitingForVerificationCode
-                ? "Enter the security code in the browser and finish signing in. Then press Enter here to load the filtered search."
-                : "Press Enter to load the filtered search.");
-            if (Console.ReadLine() is null)
+            if (waitingForVerificationCode || IsSignInUrl(searchPage.Url))
             {
-                return 0;
+                Console.WriteLine("Complete Greenhouse sign-in / security code in Chromium (no timeout — continuing automatically once signed in).");
+                await WaitForGreenhouseSignInAsync(searchPage, projectRoot, cancellation.Token);
+                if (!searchPage.IsClosed && !searchPage.Url.Contains("/jobs/search", StringComparison.OrdinalIgnoreCase))
+                {
+                    await searchPage.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+                }
             }
-
-            await searchPage.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
-            Console.WriteLine("Loaded the Greenhouse search URL with your requested filters.");
+            else
+            {
+                Console.WriteLine("Greenhouse session is active; scanning filtered results automatically.");
+            }
 
             var seenThisRun = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             while (!cancellation.IsCancellationRequested && !searchPage.IsClosed)
             {
-                var listings = await ReadListingsAsync(searchPage);
+                if (IsSignInUrl(searchPage.Url))
+                {
+                    await PrepareGreenhouseSignInAsync(searchPage, personalProfile);
+                    await WaitForGreenhouseSignInAsync(searchPage, projectRoot, cancellation.Token);
+                    if (!searchPage.IsClosed)
+                    {
+                        await searchPage.GotoAsync(SearchUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+                    }
+                }
+
+                var listings = await WaitForListingsAsync(searchPage, TimeSpan.FromSeconds(15), cancellation.Token);
                 if (listings.Count == 0)
                 {
-                    Console.WriteLine("No job links recognized yet; waiting up to 15 seconds for Greenhouse results to finish loading...");
-                    listings = await WaitForListingsAsync(searchPage, TimeSpan.FromSeconds(15), cancellation.Token);
-                    if (listings.Count == 0)
-                    {
-                        await ReportListingDiagnosticsAsync(searchPage);
-                    }
+                    await ReportListingDiagnosticsAsync(searchPage);
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(searchPage, projectRoot, "Greenhouse", "No job links recognized on Greenhouse search page");
                 }
 
                 var newListings = listings.Where(listing => seenThisRun.Add(listing.Url)).ToList();
@@ -129,50 +147,103 @@ internal static class Program
                     }
 
                     Console.WriteLine();
-                    Console.WriteLine($"Opening: {listing.Title}");
+                    Console.WriteLine($"Opening: {listing.Title} ({listing.Url})");
                     var jobPage = await context.NewPageAsync();
+                    NoTimeoutPlaywright.Configure(jobPage);
+                    activePage = jobPage;
                     IPage? applicationPopup = null;
+                    var keepCurrentJobTabs = false;
                     try
                     {
-                        await jobPage.GotoAsync(listing.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+                        await jobPage.GotoAsync(listing.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+                        await jobPage.WaitForTimeoutAsync(800);
                         if (ShouldSkipApplicationUrl(jobPage.Url))
                         {
                             Console.WriteLine($"Skipping excluded application URL after navigation: {jobPage.Url}");
                             continue;
                         }
+
+                        var bodyText = await NoTimeoutPlaywright.SafeGetBodyTextAsync(jobPage);
+                        if (Regex.IsMatch(bodyText, @"\b(?:already applied|application submitted|you applied)\b", RegexOptions.IgnoreCase))
+                        {
+                            Console.WriteLine($"Greenhouse shows this listing was already applied to: {listing.Title}");
+                            appliedJobs.Add(listing.Url);
+                            await SaveAppliedJobsAsync(appliedJobsPath, appliedJobs);
+                            continue;
+                        }
+
                         var applyControls = await FindVisibleApplyControlsAsync(jobPage);
+                        var hasInlineForm = await HasVisibleApplicationFormAsync(jobPage);
+                        IPage? applicationPage = null;
+                        TailoredResumeArtifact? tailoredResume = null;
+
+                        if (applyControls.Count == 1 || (applyControls.Count == 0 && hasInlineForm))
+                        {
+                            if (resumeTailor is not null)
+                            {
+                                var (jdText, company) = await JobDescriptionExtractor.ExtractFromPageAsync(jobPage, "Greenhouse", listing.Title);
+                                tailoredResume = await resumeTailor.TailorForJobAsync(
+                                    new JobTailoringContext("Greenhouse", listing.Title, company, jobPage.Url, jdText),
+                                    cancellation.Token);
+                            }
+                        }
+
                         if (applyControls.Count == 1)
                         {
                             Console.WriteLine("Opening the unique Apply control. The app will fill recognized fields and submit when required fields are valid.");
                             var pagesBeforeApply = context.Pages.ToHashSet();
-                            await applyControls[0].ClickAsync(new LocatorClickOptions { Timeout = 5000 });
-                            await jobPage.WaitForTimeoutAsync(800);
+                            await applyControls[0].ClickAsync();
+                            await jobPage.WaitForTimeoutAsync(1000);
                             applicationPopup = context.Pages.FirstOrDefault(page => !pagesBeforeApply.Contains(page));
                             if (applicationPopup is not null)
                             {
-                                Console.WriteLine("The application opened in a separate browser tab.");
+                                NoTimeoutPlaywright.Configure(applicationPopup);
+                                Console.WriteLine($"The application opened in a separate browser tab: {applicationPopup.Url}");
                             }
-                            var applicationPage = applicationPopup ?? jobPage;
+                            applicationPage = applicationPopup ?? jobPage;
+                        }
+                        else if (applyControls.Count == 0 && hasInlineForm)
+                        {
+                            Console.WriteLine("Application form is already visible on the job page; filling recognized fields.");
+                            applicationPage = jobPage;
+                        }
+                        else if (applyControls.Count > 1)
+                        {
+                            Console.WriteLine($"Several Apply controls ({applyControls.Count}) are visible; leaving the job page for inspection.");
+                            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(jobPage, projectRoot, "Greenhouse", $"Multiple Apply controls ({applyControls.Count}) for {listing.Title}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("No unique Apply control or inline form was found; leaving the job page open for inspection.");
+                            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(jobPage, projectRoot, "Greenhouse", $"No Apply control or inline form for {listing.Title}");
+                        }
+
+                        if (applicationPage is not null)
+                        {
+                            activePage = applicationPage;
                             if (ShouldSkipApplicationUrl(applicationPage.Url))
                             {
                                 Console.WriteLine($"Skipping excluded application URL: {applicationPage.Url}");
                                 continue;
                             }
+
                             await SelectLinkedInReferralAsync(applicationPage);
                             await CheckGdprConsentIfPresentAsync(applicationPage);
+                            var effectiveResumeText = tailoredResume?.MarkdownText ?? resumeText;
                             var fillResult = await FillRequestedApplicationFieldsAsync(
                                 applicationPage,
                                 personalProfile,
-                                string.IsNullOrWhiteSpace(resumeText) ? null : localModel,
-                                resumeText,
+                                string.IsNullOrWhiteSpace(effectiveResumeText) ? null : localModel,
+                                effectiveResumeText,
                                 listing.Title,
-                                cancellation.Token);
+                                cancellation.Token,
+                                tailoredResume?.PdfPath);
                             if (fillResult.FilledCount > 0)
                             {
                                 Console.WriteLine($"Filled {fillResult.FilledCount} recognized application field(s).");
                             }
                             var submitted = fillResult.AllQuestionsAnswered &&
-                                await OfferApplicationSubmissionAsync(applicationPage, listing.Title);
+                                await OfferApplicationSubmissionAsync(applicationPage, listing.Title, projectRoot);
                             if (!fillResult.AllQuestionsAnswered)
                             {
                                 Console.WriteLine();
@@ -182,40 +253,45 @@ internal static class Program
                                 {
                                     Console.WriteLine($"  * {q}");
                                 }
-                                Console.WriteLine("Tell the assistant in chat: 'check console' to answer these in personal.md!");
                                 Console.WriteLine("===============================================================");
                                 Console.WriteLine();
 
-                                var pendingPath = Path.Combine(projectRoot, "pending-questions.json");
-                                await File.WriteAllTextAsync(pendingPath, JsonSerializer.Serialize(new
-                                {
-                                    jobTitle = listing.Title,
-                                    jobUrl = listing.Url,
-                                    timestamp = DateTimeOffset.UtcNow,
-                                    unansweredQuestions = fillResult.UnansweredQuestions
-                                }, JsonOptions));
+                                await InteractiveBlockerResolver.WritePendingQuestionsAsync(
+                                    projectRoot,
+                                    "Greenhouse",
+                                    listing.Title,
+                                    listing.Url,
+                                    fillResult.UnansweredQuestions);
+                                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(
+                                    applicationPage,
+                                    projectRoot,
+                                    "Greenhouse",
+                                    $"Unanswered questions for {listing.Title}",
+                                    fillResult.UnansweredQuestions);
                             }
-                            if (submitted && await HasSubmissionConfirmationAsync(applicationPage))
+
+                            if (submitted && await WaitForSubmissionConfirmationAsync(applicationPage, cancellation.Token))
                             {
                                 appliedJobs.Add(listing.Url);
                                 await SaveAppliedJobsAsync(appliedJobsPath, appliedJobs);
                                 Console.WriteLine("Greenhouse confirmed the application. Recorded as applied.");
-                                var pendingPath = Path.Combine(projectRoot, "pending-questions.json");
-                                if (File.Exists(pendingPath))
-                                {
-                                    File.Delete(pendingPath);
-                                }
+                                InteractiveBlockerResolver.ClearPendingQuestions(projectRoot);
                                 await DismissApplicationSuccessAndRestoreSearchAsync(applicationPage, searchPage);
                                 continue;
                             }
+
+                            if (submitted)
+                            {
+                                Console.WriteLine($"Submit was clicked for {listing.Title}, but confirmation was not detected yet.");
+                                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(applicationPage, projectRoot, "Greenhouse", $"Unconfirmed submission after Submit for {listing.Title}");
+                            }
                         }
-                        else if (applyControls.Count > 1)
+
+                        if (Console.IsInputRedirected)
                         {
-                            Console.WriteLine("Several Apply controls are visible; leaving the job page for you to choose.");
-                        }
-                        else
-                        {
-                            Console.WriteLine("No unique Apply control was found; leaving the job page open for manual review.");
+                            keepCurrentJobTabs = true;
+                            Console.WriteLine($"Leaving application tab open for {listing.Title} and continuing to the next listing (non-interactive console).");
+                            continue;
                         }
 
                         Console.WriteLine("Complete the application in the browser if you want to apply.");
@@ -238,25 +314,36 @@ internal static class Program
                         }
                         else if (action is null)
                         {
+                            keepCurrentJobTabs = true;
+                            keepJobPagesForTroubleshooting = true;
+                            keepOpenReason = $"Console input ended while reviewing {listing.Title}.";
                             return 0;
                         }
                     }
                     catch
                     {
+                        keepCurrentJobTabs = true;
                         keepJobPagesForTroubleshooting = true;
                         throw;
                     }
                     finally
                     {
-                        if (!keepJobPagesForTroubleshooting && applicationPopup is not null && !applicationPopup.IsClosed)
+                        if (!keepCurrentJobTabs && !keepJobPagesForTroubleshooting && applicationPopup is not null && !applicationPopup.IsClosed)
                         {
                             await applicationPopup.CloseAsync();
                         }
-                        if (!keepJobPagesForTroubleshooting && !jobPage.IsClosed)
+                        if (!keepCurrentJobTabs && !keepJobPagesForTroubleshooting && !jobPage.IsClosed)
                         {
                             await jobPage.CloseAsync();
                         }
                     }
+                }
+
+                if (Console.IsInputRedirected)
+                {
+                    keepOpenReason = $"Greenhouse finished scanning {newListings.Count} listing(s) on this page.";
+                    Console.WriteLine(keepOpenReason);
+                    break;
                 }
 
                 Console.WriteLine();
@@ -273,27 +360,27 @@ internal static class Program
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("Run cancelled.");
+            keepOpenReason = "Run cancelled.";
+            Console.WriteLine(keepOpenReason);
             return 0;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("Greenhouse runner failed with an exception:");
             Console.Error.WriteLine(ex.ToString());
-            if (context is not null)
-            {
-                Console.WriteLine("Chromium and the failed application tab are being kept open for troubleshooting. Press Enter after inspecting them to close the browser and exit.");
-                await Console.In.ReadLineAsync();
-            }
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(activePage, projectRoot, "Greenhouse", $"Unhandled exception: {ex.Message}");
+            keepOpenReason = "Greenhouse runner stopped after an error.";
             return 1;
         }
         finally
         {
             Console.CancelKeyPress -= cancelHandler;
-            if (context is not null)
+            await NoTimeoutPlaywright.KeepBrowserOpenUntilClosedAsync(context, browserClosed, keepOpenReason);
+            if (resumeTailor is not null)
             {
-                await context.CloseAsync();
+                await resumeTailor.DisposeAsync();
             }
+            playwright?.Dispose();
             localModel?.Dispose();
         }
     }
@@ -355,7 +442,8 @@ internal static class Program
         LocalModelAnswerClient? localModel,
         string resumeText,
         string jobTitle,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? tailoredResumePdfPath = null)
     {
         var filledCount = 0;
         filledCount += await FillResidenceQuestionAsync(
@@ -364,6 +452,8 @@ internal static class Program
         var fullLegalName = string.Join(' ', new[] { personalProfile?.LegalFirstName, personalProfile?.LegalLastName }
             .Where(value => !string.IsNullOrWhiteSpace(value)));
         filledCount += await FillFullLegalNameQuestionsAsync(page, fullLegalName);
+
+        await ExternalApplicationFormAssistant.DismissLoseProgressDialogIfPresentAsync(page);
 
         var authorizationAnswer = personalProfile?.AnswerForQuestion(
             "Are you authorized to reside and work in the country where this role is based?");
@@ -387,6 +477,30 @@ internal static class Program
                 "visa sponsorship");
         }
 
+        var usLocationAnswer = personalProfile?.AnswerForQuestion(
+            "Are you currently located in the United States?");
+        if (usLocationAnswer is "Yes" or "No")
+        {
+            filledCount += await FillLabeledBooleanComboboxAsync(
+                page,
+                label => label.Contains("located in the united states", StringComparison.OrdinalIgnoreCase) ||
+                         label.Contains("reside in the united states", StringComparison.OrdinalIgnoreCase) ||
+                         (label.Contains("united states", StringComparison.OrdinalIgnoreCase) && label.Contains("located", StringComparison.OrdinalIgnoreCase)),
+                usLocationAnswer,
+                "US location");
+        }
+
+        var clearanceAnswer = personalProfile?.AnswerForQuestion(
+            "Are you eligible to obtain and maintain a U.S. Government Clearance (Requires U.S Citizenship)?");
+        if (clearanceAnswer is "Yes" or "No")
+        {
+            filledCount += await FillLabeledBooleanComboboxAsync(
+                page,
+                label => label.Contains("clearance", StringComparison.OrdinalIgnoreCase),
+                clearanceAnswer,
+                "government clearance");
+        }
+
         var veteranAnswer = personalProfile?.VeteranStatus;
         if (veteranAnswer is "Yes" or "No")
         {
@@ -400,6 +514,8 @@ internal static class Program
         filledCount += await FillUniqueVisibleFieldAsync(page, "Legal First Name", personalProfile?.LegalFirstName);
         filledCount += await FillUniqueVisibleFieldAsync(page, "Legal Last Name", personalProfile?.LegalLastName);
 
+        await ExternalApplicationFormAssistant.DismissLoseProgressDialogIfPresentAsync(page);
+
         try
         {
             var result = await ExternalApplicationFormAssistant.DraftBlankFieldsAsync(
@@ -409,7 +525,8 @@ internal static class Program
                 resumeText,
                 personalProfile?.Residence,
                 cancellationToken,
-                personalProfile);
+                personalProfile,
+                tailoredResumePdfPath);
             filledCount += result.FilledCount;
             return new ApplicationFieldFillResult(filledCount, result.UnansweredQuestions.Count == 0, result.UnansweredQuestions);
         }
@@ -460,7 +577,7 @@ internal static class Program
             return 0;
         }
 
-        await matches[0].ScrollIntoViewIfNeededAsync();
+        await NoTimeoutPlaywright.SafeScrollIntoViewAsync(matches[0]);
         await matches[0].FillAsync(answer);
         Console.WriteLine("Filled the residence question from personal.md.");
         return 1;
@@ -505,7 +622,7 @@ internal static class Program
 
             if (labels.Any(ContainsFullLegalNameTerms))
             {
-                await field.ScrollIntoViewIfNeededAsync();
+                await NoTimeoutPlaywright.SafeScrollIntoViewAsync(field);
                 await field.FillAsync(fullLegalName);
                 filledCount++;
             }
@@ -519,7 +636,8 @@ internal static class Program
         var words = Regex.Matches(label, @"[\p{L}\p{N}]+")
             .Select(match => match.Value)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return words.Contains("full") && words.Contains("legal") && words.Contains("name");
+        return (words.Contains("legal") && words.Contains("name")) ||
+               (words.Contains("full") && words.Contains("name"));
     }
 
     private static bool IsVisaSponsorshipQuestion(string label)
@@ -556,10 +674,15 @@ internal static class Program
             }
 
             var label = await control.EvaluateAsync<string>(
-                "element => { const ids = (element.getAttribute('aria-labelledby') || '').split(/\\s+/).filter(Boolean); " +
-                "const referenced = ids.map(id => document.getElementById(id)?.innerText || ''); " +
-                "const native = element.labels ? Array.from(element.labels).map(label => label.innerText || '') : []; " +
-                "return [element.getAttribute('aria-label') || '', ...referenced, ...native].join(' ').trim(); }");
+                """
+                element => {
+                    const ids = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+                    const referenced = ids.map(id => document.getElementById(id)?.innerText || '');
+                    const native = element.labels ? Array.from(element.labels).map(label => label.innerText || '') : [];
+                    const parent = element.closest('.field, .form-field, .application-question, fieldset, [class*="field"], [class*="question"]');
+                    return [element.getAttribute('aria-label') || '', ...referenced, ...native, parent?.innerText || ''].join(' ').trim();
+                }
+                """);
             if (matchesQuestion(label))
             {
                 matches.Add(control);
@@ -581,7 +704,7 @@ internal static class Program
         {
             try
             {
-                await match.ScrollIntoViewIfNeededAsync();
+                await NoTimeoutPlaywright.SafeScrollIntoViewAsync(match);
                 var tagName = await match.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
                 if (tagName == "select")
                 {
@@ -606,8 +729,13 @@ internal static class Program
                 }
                 else
                 {
-                    await match.ClickAsync(new LocatorClickOptions { Force = true });
-                    var options = page.Locator("[role='option'], .select__option");
+                    var controlContainer = match.Locator("xpath=ancestor::*[contains(@class, 'select__control')][1]");
+                    var clickTarget = await controlContainer.CountAsync() > 0 ? controlContainer.First : match;
+                    await NoTimeoutPlaywright.SafeScrollIntoViewAsync(clickTarget);
+                    await clickTarget.ClickAsync();
+                    await page.WaitForTimeoutAsync(250);
+
+                    var options = page.Locator("[role='option'], .select__option, div[class*='-option']");
                     var visibleOptions = new List<ILocator>();
                     for (var index = 0; index < await options.CountAsync(); index++)
                     {
@@ -621,7 +749,8 @@ internal static class Program
                     if (visibleOptions.Count != 1)
                     {
                         // Toggle closed safely without pressing Escape which closes the application modal
-                        await match.ClickAsync(new LocatorClickOptions { Force = true });
+                        await clickTarget.ClickAsync();
+                        await ExternalApplicationFormAssistant.DismissLoseProgressDialogIfPresentAsync(page);
                         Console.WriteLine($"Could not identify a unique {answer} option for {description}; please answer it manually.");
                         continue;
                     }
@@ -638,6 +767,7 @@ internal static class Program
             catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
             {
                 Console.WriteLine($"Could not answer the {description} question; please answer it manually. ({ex.Message})");
+                await ExternalApplicationFormAssistant.DismissLoseProgressDialogIfPresentAsync(page);
             }
         }
         return filledCount;
@@ -653,9 +783,22 @@ internal static class Program
             return true;
         }
 
-        return normalizedAnswer.Equals("No", StringComparison.OrdinalIgnoreCase) &&
-            (normalizedOption.Contains("not a veteran", StringComparison.OrdinalIgnoreCase) ||
-             normalizedOption.Contains("not a protected veteran", StringComparison.OrdinalIgnoreCase));
+        if (normalizedAnswer.Equals("Yes", StringComparison.OrdinalIgnoreCase) &&
+            (normalizedOption.Equals("true", StringComparison.OrdinalIgnoreCase) || normalizedOption.Equals("1", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        if (normalizedAnswer.Equals("No", StringComparison.OrdinalIgnoreCase) &&
+            (normalizedOption.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+             normalizedOption.Equals("0", StringComparison.OrdinalIgnoreCase) ||
+             normalizedOption.Contains("not a veteran", StringComparison.OrdinalIgnoreCase) ||
+             normalizedOption.Contains("not a protected veteran", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static async Task<int> FillUniqueVisibleFieldAsync(IPage page, string fieldName, string? value)
@@ -686,7 +829,7 @@ internal static class Program
             return 0;
         }
 
-        await visibleFields[0].ScrollIntoViewIfNeededAsync();
+        await NoTimeoutPlaywright.SafeScrollIntoViewAsync(visibleFields[0]);
         await visibleFields[0].FillAsync(value);
         return 1;
     }
@@ -706,7 +849,7 @@ internal static class Program
 
         if (questionTextFields.Count == 1)
         {
-            await questionTextFields[0].ScrollIntoViewIfNeededAsync();
+            await NoTimeoutPlaywright.SafeScrollIntoViewAsync(questionTextFields[0]);
             await questionTextFields[0].FillAsync("LinkedIn");
             Console.WriteLine("Answered ‘How did you hear about this job?’ with LinkedIn.");
             return;
@@ -738,7 +881,7 @@ internal static class Program
         {
             try
             {
-                await questionComboBoxes[0].ScrollIntoViewIfNeededAsync();
+                await NoTimeoutPlaywright.SafeScrollIntoViewAsync(questionComboBoxes[0]);
                 await questionComboBoxes[0].ClickAsync();
                 var linkedinOption = page.GetByRole(AriaRole.Option, new() { Name = "LinkedIn", Exact = true });
                 var visibleOptions = new List<ILocator>();
@@ -793,32 +936,53 @@ internal static class Program
             "const native = element.labels ? Array.from(element.labels).map(label => label.innerText || '') : []; " +
             "return [element.getAttribute('aria-label') || '', ...referenced, ...native].join(' ').trim(); }");
 
+    private static bool IsSignInUrl(string url) =>
+        url.Contains("/users/sign_in", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("/sign_in", StringComparison.OrdinalIgnoreCase) ||
+        url.Contains("/login", StringComparison.OrdinalIgnoreCase);
+
+    private static async Task WaitForGreenhouseSignInAsync(IPage page, string projectRoot, CancellationToken cancellationToken)
+    {
+        var lastReminder = DateTimeOffset.UtcNow;
+        var dumped = false;
+        while (!page.IsClosed && IsSignInUrl(page.Url))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (DateTimeOffset.UtcNow - lastReminder > TimeSpan.FromSeconds(20))
+            {
+                lastReminder = DateTimeOffset.UtcNow;
+                Console.WriteLine($"Still waiting for Greenhouse sign-in in Chromium (no timeout). Current page: {page.Url}");
+                if (!dumped)
+                {
+                    dumped = true;
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Greenhouse", "Waiting for Greenhouse sign-in");
+                }
+            }
+            await page.WaitForTimeoutAsync(1000);
+        }
+    }
+
+    private static async Task<bool> HasVisibleApplicationFormAsync(IPage page)
+    {
+        var inputs = page.Locator("form input:not([type='hidden']):not([type='search']), form textarea, form select, [role='dialog'] input:not([type='hidden'])");
+        for (var i = 0; i < await inputs.CountAsync(); i++)
+        {
+            if (await inputs.Nth(i).IsVisibleAsync())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static async Task CheckGdprConsentIfPresentAsync(IPage page)
     {
         const string consentId = "gdpr_demographic_data_consent_given_1";
         var consent = page.Locator($"input#{consentId}[type='checkbox']");
-        if (await consent.CountAsync() == 1 && await consent.First.IsVisibleAsync() && !await consent.First.IsCheckedAsync())
+        if (await consent.CountAsync() == 1 && !await consent.First.IsCheckedAsync())
         {
-            try
-            {
-                await consent.First.CheckAsync();
-            }
-            catch (PlaywrightException)
-            {
-                // Fall back to the rendered label for styled/custom checkboxes.
-            }
-
-            if (!await consent.First.IsCheckedAsync())
-            {
-                var label = page.Locator($"label[for='{consentId}']");
-                if (await label.CountAsync() == 1 && await label.First.IsVisibleAsync())
-                {
-                    try { await label.First.ClickAsync(); }
-                    catch (PlaywrightException) { }
-                }
-            }
-
-            if (await consent.First.IsCheckedAsync())
+            var label = page.Locator($"label[for='{consentId}']");
+            if (await NoTimeoutPlaywright.SafeCheckAsync(consent.First, label))
             {
                 Console.WriteLine("Checked the specified GDPR demographic-data consent box.");
             }
@@ -829,16 +993,16 @@ internal static class Program
         }
     }
 
-    private static async Task<bool> OfferApplicationSubmissionAsync(IPage page, string jobTitle)
+    private static async Task<bool> OfferApplicationSubmissionAsync(IPage page, string jobTitle, string projectRoot)
     {
         var submitButtons = page.GetByRole(
             AriaRole.Button,
-            new() { NameRegex = new Regex("^submit application$", RegexOptions.IgnoreCase) });
+            new() { NameRegex = new Regex(@"^\s*(submit application|submit|send application|apply now)\s*$", RegexOptions.IgnoreCase) });
         var visibleButtons = new List<ILocator>();
         for (var index = 0; index < await submitButtons.CountAsync(); index++)
         {
             var button = submitButtons.Nth(index);
-            if (await button.IsVisibleAsync())
+            if (await button.IsVisibleAsync() && !await button.IsDisabledAsync())
             {
                 visibleButtons.Add(button);
             }
@@ -846,22 +1010,49 @@ internal static class Program
 
         if (visibleButtons.Count != 1)
         {
+            Console.WriteLine($"Expected 1 enabled Submit button for {jobTitle}, found {visibleButtons.Count}.");
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Greenhouse", $"Found {visibleButtons.Count} Submit buttons for {jobTitle}");
             return false;
         }
 
         var invalidRequiredFields = page.Locator(
             "input:required:invalid, textarea:required:invalid, select:required:invalid, " +
             "[aria-required='true'][aria-invalid='true']");
-        if (await invalidRequiredFields.CountAsync() > 0)
+        var visibleInvalidCount = 0;
+        for (var i = 0; i < await invalidRequiredFields.CountAsync(); i++)
         {
-            Console.WriteLine($"Required application fields remain incomplete for {jobTitle}; leaving the form open for you.");
+            if (await invalidRequiredFields.Nth(i).IsVisibleAsync())
+            {
+                visibleInvalidCount++;
+            }
+        }
+        if (visibleInvalidCount > 0)
+        {
+            Console.WriteLine($"Required application fields ({visibleInvalidCount}) remain incomplete for {jobTitle}; leaving the form open for you.");
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Greenhouse", $"Invalid required fields ({visibleInvalidCount}) for {jobTitle}");
             return false;
         }
 
         Console.WriteLine($"Submitting the completed Greenhouse application for {jobTitle}.");
+        await NoTimeoutPlaywright.SafeScrollIntoViewAsync(visibleButtons[0]);
         await visibleButtons[0].ClickAsync();
-        await page.WaitForTimeoutAsync(1500);
+        await page.WaitForTimeoutAsync(1000);
         return true;
+    }
+
+    private static async Task<bool> WaitForSubmissionConfirmationAsync(IPage page, CancellationToken cancellationToken)
+    {
+        var started = DateTimeOffset.UtcNow;
+        while (!page.IsClosed && DateTimeOffset.UtcNow - started < TimeSpan.FromSeconds(15))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (await HasSubmissionConfirmationAsync(page))
+            {
+                return true;
+            }
+            await page.WaitForTimeoutAsync(500);
+        }
+        return await HasSubmissionConfirmationAsync(page);
     }
 
     private static async Task<bool> HasSubmissionConfirmationAsync(IPage page)
@@ -871,12 +1062,10 @@ internal static class Program
             return false;
         }
 
-        var confirmation = page.Locator("[role='dialog'], .modal, .confirmation, [class*='success'], [class*='submitted']");
-        var target = await confirmation.CountAsync() > 0 ? confirmation.First : page.Locator("body");
-        var text = await target.InnerTextAsync();
+        var text = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
         return Regex.IsMatch(
             text,
-            @"(?:your\s+)?application (?:has been|was) submitted|thank you for applying|successfully submitted",
+            @"(?:your\s+)?application (?:has been|was) (?:submitted|received|sent)|thank you for applying|thanks for applying|application received|successfully submitted|we have received your application",
             RegexOptions.IgnoreCase);
     }
 
@@ -948,13 +1137,29 @@ internal static class Program
         CancellationToken cancellationToken)
     {
         var deadline = DateTimeOffset.UtcNow + timeout;
+        var lastCount = -1;
+        var stableTicks = 0;
         while (DateTimeOffset.UtcNow < deadline && !page.IsClosed)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var listings = await ReadListingsAsync(page);
-            if (listings.Count > 0)
+            var body = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
+            var stillLoading = body.Contains("Loading...", StringComparison.OrdinalIgnoreCase);
+            if (listings.Count > 0 && !stillLoading)
             {
-                return listings;
+                if (listings.Count == lastCount)
+                {
+                    stableTicks++;
+                    if (stableTicks >= 2)
+                    {
+                        return listings;
+                    }
+                }
+                else
+                {
+                    lastCount = listings.Count;
+                    stableTicks = 0;
+                }
             }
 
             await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
@@ -989,7 +1194,7 @@ internal static class Program
         var controls = new List<ILocator>();
         foreach (var role in new[] { AriaRole.Button, AriaRole.Link })
         {
-            var candidates = page.GetByRole(role, new() { NameRegex = new Regex(@"^apply(?: now)?$", RegexOptions.IgnoreCase) });
+            var candidates = page.GetByRole(role, new() { NameRegex = new Regex(@"^\s*(?:easy\s+)?apply(?:\s+(?:now|for this job|with greenhouse|to this job))?\s*$", RegexOptions.IgnoreCase) });
             for (var index = 0; index < await candidates.CountAsync(); index++)
             {
                 var candidate = candidates.Nth(index);

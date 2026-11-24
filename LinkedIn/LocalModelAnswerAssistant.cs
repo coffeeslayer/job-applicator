@@ -125,7 +125,7 @@ public sealed class LocalModelAnswerClient : IDisposable
     {
         if (string.IsNullOrWhiteSpace(question) ||
             IsHighImpactQuestion(question) ||
-            fieldType is not ("text" or "email" or "tel" or "textarea" or "select"))
+            fieldType is not ("text" or "email" or "tel" or "textarea" or "select" or "radio"))
         {
             return null;
         }
@@ -268,17 +268,37 @@ public static class ExternalApplicationFormAssistant
         string resumeText,
         string? residenceCityStateZip,
         CancellationToken cancellationToken,
-        PersonalProfile? personalProfile = null)
+        PersonalProfile? personalProfile = null,
+        string? resumeFilePathOverride = null)
     {
         var formTitle = await page.TitleAsync();
         ILocator formRoot = page.Locator("body");
         var dialogs = page.GetByRole(AriaRole.Dialog);
+        var foundDialog = false;
         for (var index = 0; index < await dialogs.CountAsync(); index++)
         {
             var dialog = dialogs.Nth(index);
             if (await dialog.IsVisibleAsync())
             {
                 formRoot = dialog;
+                foundDialog = true;
+            }
+        }
+        if (!foundDialog)
+        {
+            var forms = page.Locator("form");
+            for (var index = 0; index < await forms.CountAsync(); index++)
+            {
+                var form = forms.Nth(index);
+                if (!await form.IsVisibleAsync())
+                {
+                    continue;
+                }
+                var formInputCount = await form.Locator("input:not([type='hidden']):not([type='search']), textarea, select").CountAsync();
+                if (formInputCount >= 2)
+                {
+                    formRoot = form;
+                }
             }
         }
         var fields = formRoot.Locator(FieldSelector);
@@ -286,10 +306,20 @@ public static class ExternalApplicationFormAssistant
         var draftedCount = personalProfile is null
             ? 0
             : await FillPersonalProfileFieldsAsync(page, formRoot, personalProfile, cancellationToken);
-        draftedCount += await ResumeUploadAssistant.UploadResumeAsync(formRoot, cancellationToken);
+        var effectiveResumePath = !string.IsNullOrWhiteSpace(resumeFilePathOverride) && File.Exists(resumeFilePathOverride)
+            ? resumeFilePathOverride
+            : personalProfile?.ResumeFile;
+        var hasTailoredOverride = !string.IsNullOrWhiteSpace(resumeFilePathOverride) && File.Exists(resumeFilePathOverride);
+        draftedCount += await ResumeUploadAssistant.UploadResumeAsync(
+            formRoot,
+            cancellationToken,
+            effectiveResumePath,
+            replaceExisting: hasTailoredOverride);
         var unansweredQuestions = new List<string>();
 
         var choiceFields = formRoot.Locator("input[type='radio'], input[type='checkbox'], input[type='file']");
+        var handledRadioGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         for (var index = 0; index < await choiceFields.CountAsync(); index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -303,51 +333,189 @@ public static class ExternalApplicationFormAssistant
             {
                 var label = choice.Locator("xpath=ancestor::label[1]");
                 choiceVisible = await label.CountAsync() > 0 && await label.IsVisibleAsync();
+                if (!choiceVisible)
+                {
+                    var choiceId = await choice.GetAttributeAsync("id");
+                    if (!string.IsNullOrWhiteSpace(choiceId))
+                    {
+                        var forLabel = formRoot.Locator($"label[for={JsonSerializer.Serialize(choiceId)}]");
+                        choiceVisible = await forLabel.CountAsync() > 0 && await forLabel.First.IsVisibleAsync();
+                    }
+                }
             }
             if (!choiceVisible)
             {
                 continue;
             }
 
-            var question = await choice.EvaluateAsync<string>(
-                """
-                element => {
-                    const type = (element.getAttribute('type') || '').toLowerCase();
-                    if (type === 'radio') {
+            var choiceType = (await choice.GetAttributeAsync("type") ?? "").ToLowerInvariant();
+
+            if (choiceType == "radio")
+            {
+                var name = await choice.GetAttributeAsync("name") ?? "";
+                if (!string.IsNullOrWhiteSpace(name) && !handledRadioGroups.Add(name))
+                {
+                    continue;
+                }
+
+                var isGroupChecked = await choice.EvaluateAsync<bool>(
+                    """
+                    element => {
                         const name = element.getAttribute('name');
                         const group = name
-                            ? Array.from(document.querySelectorAll('input[type="radio"]')).filter(item => item.name === name)
-                            : [element];
-                        if (group.some(item => item.checked)) return '';
-                    } else if (type === 'checkbox' && element.checked) {
-                        return '';
-                    } else if (type === 'file' && element.files?.length) {
-                        return '';
+                            ? Array.from(document.querySelectorAll('input[type="radio"]')).filter(item => item.getAttribute('name') === name)
+                            : Array.from((element.closest('fieldset, [role="radiogroup"], [role="group"]') || element.parentElement || document).querySelectorAll('input[type="radio"]'));
+                        return group.some(item => item.checked);
                     }
-                    const container = element.closest('fieldset, .field, .form-field, .application-question, [class*="question"]');
-                    const text = (container?.innerText || '').trim();
-                    const labels = Array.from(element.labels || []).map(label => label.innerText.trim()).filter(Boolean).join(' ');
-                    return text || labels || element.getAttribute('aria-label') || element.getAttribute('name') || '';
-                }
-                """);
-            if (!string.IsNullOrWhiteSpace(question))
-            {
-                var choiceType = (await choice.GetAttributeAsync("type") ?? "").ToLowerInvariant();
-                var explicitAnswer = personalProfile?.AnswerForQuestion(question);
-                if (!(choiceType == "checkbox" &&
-                      string.Equals(explicitAnswer, "No", StringComparison.OrdinalIgnoreCase)))
+                    """);
+                if (isGroupChecked)
                 {
-                    if (string.IsNullOrWhiteSpace(explicitAnswer) && choiceType == "radio")
+                    continue;
+                }
+
+                var question = await GetRadioGroupQuestionAsync(choice);
+                if (string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(question) &&
+                    !handledRadioGroups.Add($"question:{question}"))
+                {
+                    continue;
+                }
+
+                var radioOptions = await GetRadioGroupOptionsAsync(choice);
+                var chosenAnswer = personalProfile?.AnswerForQuestion(question);
+                if (string.IsNullOrWhiteSpace(chosenAnswer) &&
+                    model is not null &&
+                    !string.IsNullOrWhiteSpace(question) &&
+                    !LocalModelAnswerClient.IsHighImpactQuestion(question) &&
+                    radioOptions.Count > 0)
+                {
+                    var radioDraft = await model.CreateDraftAsync(
+                        question,
+                        "radio",
+                        jobTitle,
+                        formTitle,
+                        resumeText,
+                        radioOptions,
+                        cancellationToken);
+                    if (radioDraft?.Answer is not null)
                     {
-                        var options = await choice.EvaluateAsync<string>(
-                            "element => { const name = element.name; const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(item => item.name === name); " +
-                            "return radios.map(item => Array.from(item.labels || []).map(label => label.innerText.trim()).join(' ') || item.value).filter(Boolean).join(' | '); }");
-                        if (!string.IsNullOrWhiteSpace(options))
+                        Console.WriteLine();
+                        Console.WriteLine($"  Using resume-supported answer for \"{question}\".");
+                        Console.WriteLine($"  Resume evidence: {radioDraft.Evidence}");
+                        chosenAnswer = radioDraft.Answer;
+                    }
+                }
+
+                var answered = false;
+                if (!string.IsNullOrWhiteSpace(chosenAnswer))
+                {
+                    ILocator radios;
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        radios = formRoot.Locator($"input[type='radio'][name={JsonSerializer.Serialize(name)}]");
+                    }
+                    else
+                    {
+                        var groupContainer = choice.Locator("xpath=ancestor::*[self::fieldset or @role='radiogroup' or @role='group'][1]");
+                        radios = await groupContainer.CountAsync() > 0
+                            ? groupContainer.First.Locator("input[type='radio']")
+                            : choice;
+                    }
+
+                    var radioCount = await radios.CountAsync();
+                    for (var rIdx = 0; rIdx < radioCount; rIdx++)
+                    {
+                        var radio = radios.Nth(rIdx);
+                        var optLabel = await GetRadioOptionLabelAsync(radio);
+                        var optValue = (await radio.GetAttributeAsync("value") ?? "").Trim();
+                        var optAria = (await radio.GetAttributeAsync("aria-label") ?? "").Trim();
+                        var primaryLabel = !string.IsNullOrWhiteSpace(optLabel) ? optLabel
+                            : !string.IsNullOrWhiteSpace(optAria) ? optAria
+                            : optValue;
+                        if (AnswersEqual(chosenAnswer, primaryLabel))
                         {
-                            Console.WriteLine($"  Choices for \"{question}\": {options}");
+                            if (await CheckRadioOrLabelAsync(formRoot, radio))
+                            {
+                                Console.WriteLine($"  Selected '{primaryLabel}' for '{question}'.");
+                                draftedCount++;
+                                answered = true;
+                            }
+                            else
+                            {
+                                Console.WriteLine($"  Matched '{primaryLabel}' for '{question}' (answer '{chosenAnswer}'), but could not check it.");
+                            }
+                            break;
                         }
                     }
+                }
+
+                if (!answered)
+                {
+                    if (radioOptions.Count > 0)
+                    {
+                        Console.WriteLine($"  Choices for \"{question}\": {string.Join(" | ", radioOptions)}");
+                    }
                     unansweredQuestions.Add(question);
+                }
+            }
+            else if (choiceType == "checkbox")
+            {
+                if (await choice.IsCheckedAsync())
+                {
+                    continue;
+                }
+
+                var question = await choice.EvaluateAsync<string>(
+                    """
+                    element => {
+                        const labels = Array.from(element.labels || []).map(label => label.innerText.trim()).filter(Boolean).join(' ');
+                        const container = element.closest('.field, .form-field, .application-question, [class*="question"]');
+                        return labels || (container?.innerText || '').trim() || element.getAttribute('aria-label') || '';
+                    }
+                    """);
+
+                var explicitAnswer = personalProfile?.AnswerForQuestion(question);
+                if (string.Equals(explicitAnswer, "Yes", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(explicitAnswer, "Agree", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(explicitAnswer, "True", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (await CheckRadioOrLabelAsync(formRoot, choice))
+                    {
+                        Console.WriteLine($"  Checked '{question}'.");
+                        draftedCount++;
+                    }
+                    else
+                    {
+                        unansweredQuestions.Add(question);
+                    }
+                }
+                else if (string.Equals(explicitAnswer, "No", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(explicitAnswer, "False", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Desired answer is No for a checkbox: leaving it unchecked satisfies the requirement.
+                }
+                else
+                {
+                    unansweredQuestions.Add(question);
+                }
+            }
+            else if (choiceType == "file")
+            {
+                var question = await choice.EvaluateAsync<string>(
+                    """
+                    element => {
+                        if (element.files?.length) return '';
+                        const isRequired = element.required || element.getAttribute('aria-required') === 'true' ||
+                                           Boolean(element.closest('.required, [class*="required"]')?.querySelector('label'));
+                        if (!isRequired) return '';
+                        const labels = Array.from(element.labels || []).map(l => l.innerText.trim()).filter(Boolean).join(' ');
+                        const container = element.closest('.field, .form-field, [class*="upload"]');
+                        const labelText = container?.querySelector('label, [class*="label"]')?.innerText || '';
+                        return labels || labelText || element.getAttribute('aria-label') || '';
+                    }
+                    """);
+                if (!string.IsNullOrWhiteSpace(question))
+                {
+                    unansweredQuestions.Add(question.Trim());
                 }
             }
         }
@@ -366,7 +534,7 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
 
-            await field.ScrollIntoViewIfNeededAsync();
+            await NoTimeoutPlaywright.SafeScrollIntoViewAsync(field);
 
             var type = (await field.GetAttributeAsync("type") ?? "").ToLowerInvariant();
             var tag = await field.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
@@ -383,6 +551,17 @@ public static class ExternalApplicationFormAssistant
                 type = "text";
             }
             var currentValue = await field.InputValueAsync();
+            if (string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
+            {
+                var selectedValue = await field.EvaluateAsync<string>(
+                    "element => element.closest('.select__control, [class*=\"control\"]')?.querySelector('[class*=\"single-value\"], [class*=\"singleValue\"], [class*=\"multi-value\"], [class*=\"multiValue\"]')?.innerText || " +
+                    "element.parentElement?.parentElement?.querySelector('[class*=\"single-value\"], [class*=\"singleValue\"]')?.innerText || ''");
+                if (!string.IsNullOrWhiteSpace(selectedValue))
+                {
+                    continue;
+                }
+            }
+
             var question = await GetFieldQuestionAsync(field);
             if (string.Equals(
                     AnswerMatcher.Normalize(question),
@@ -391,6 +570,7 @@ public static class ExternalApplicationFormAssistant
             {
                 continue;
             }
+            var isFieldRequired = await IsFieldRequiredAsync(field, question);
             if (ResidenceQuestion.IsMatch(question) && !string.IsNullOrWhiteSpace(residenceCityStateZip))
             {
                 if (type == "select")
@@ -424,10 +604,36 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
 
+            var explicitProfileAnswer = personalProfile?.AnswerForQuestion(question);
+            if (!string.IsNullOrWhiteSpace(explicitProfileAnswer))
+            {
+                // FillPersonalProfileFieldsAsync already attempted to fill this field. If it is
+                // still blank here and required, report it as unanswered rather than silently skipping.
+                if (isFieldRequired && !string.IsNullOrWhiteSpace(question))
+                {
+                    unansweredQuestions.Add(question);
+                }
+                continue;
+            }
+
+            if (!isFieldRequired && IsConditionalOrOptionalFollowUp(question))
+            {
+                continue;
+            }
+            if (isFieldRequired &&
+                type is ("text" or "textarea") &&
+                Regex.IsMatch(question ?? "", @"^\s*if\s+other\b", RegexOptions.IgnoreCase))
+            {
+                await field.FillAsync("N/A");
+                draftedCount++;
+                Console.WriteLine($"  Filled conditional follow-up '{question}' with 'N/A'.");
+                continue;
+            }
+
             if (string.IsNullOrWhiteSpace(question) ||
                 LocalModelAnswerClient.IsHighImpactQuestion(question))
             {
-                if (!string.IsNullOrWhiteSpace(question))
+                if (isFieldRequired && !string.IsNullOrWhiteSpace(question))
                 {
                     Console.WriteLine($"  Leaving high-impact field for manual input: {question}");
                     unansweredQuestions.Add(question);
@@ -437,14 +643,20 @@ public static class ExternalApplicationFormAssistant
 
             if (type is not ("text" or "email" or "tel" or "textarea" or "select"))
             {
-                unansweredQuestions.Add(question);
-                Console.WriteLine($"  This field type needs your input: {question}");
+                if (isFieldRequired)
+                {
+                    unansweredQuestions.Add(question);
+                    Console.WriteLine($"  This field type needs your input: {question}");
+                }
                 continue;
             }
             if (model is null)
             {
-                unansweredQuestions.Add(question);
-                Console.WriteLine($"  No local model is configured for: {question}");
+                if (isFieldRequired)
+                {
+                    unansweredQuestions.Add(question);
+                    Console.WriteLine($"  No local model is configured for: {question}");
+                }
                 continue;
             }
 
@@ -522,41 +734,58 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
             var radioVisible = await radio.IsVisibleAsync();
-            var radioLabel = radio.Locator("xpath=ancestor::label[1]");
-            if (!radioVisible && (await radioLabel.CountAsync() == 0 || !await radioLabel.IsVisibleAsync()))
+            if (!radioVisible)
+            {
+                var radioLabel = radio.Locator("xpath=ancestor::label[1]");
+                radioVisible = await radioLabel.CountAsync() > 0 && await radioLabel.IsVisibleAsync();
+                if (!radioVisible)
+                {
+                    var radioId = await radio.GetAttributeAsync("id");
+                    if (!string.IsNullOrWhiteSpace(radioId))
+                    {
+                        var forLabel = formRoot.Locator($"label[for={JsonSerializer.Serialize(radioId)}]");
+                        radioVisible = await forLabel.CountAsync() > 0 && await forLabel.First.IsVisibleAsync();
+                    }
+                }
+            }
+            if (!radioVisible)
             {
                 continue;
             }
 
-            var name = await radio.GetAttributeAsync("name") ?? $"radio-{index}";
+            var rawName = await radio.GetAttributeAsync("name");
+            var name = string.IsNullOrWhiteSpace(rawName) ? $"radio-{index}" : rawName;
             if (!seenGroups.Add(name))
             {
                 continue;
             }
 
-            var question = await radio.EvaluateAsync<string>(
-                "element => { const group = element.closest('fieldset, [role=group], .field, .form-field, .application-question, [class*=question]'); " +
-                "return (group?.innerText || element.getAttribute('aria-label') || '').trim(); }");
+            var question = await GetRadioGroupQuestionAsync(radio);
             var answer = profile.AnswerForQuestion(question);
             if (string.IsNullOrWhiteSpace(answer))
             {
                 continue;
             }
 
-            var group = page.Locator("input[type='radio']");
+            var group = formRoot.Locator("input[type='radio']");
             var matches = new List<ILocator>();
             for (var optionIndex = 0; optionIndex < await group.CountAsync(); optionIndex++)
             {
                 var option = group.Nth(optionIndex);
-                if (!string.Equals(await option.GetAttributeAsync("name") ?? $"radio-{optionIndex}", name, StringComparison.Ordinal))
+                var optionRawName = await option.GetAttributeAsync("name");
+                var optionName = string.IsNullOrWhiteSpace(optionRawName) ? $"radio-{optionIndex}" : optionRawName;
+                if (!string.Equals(optionName, name, StringComparison.Ordinal))
                 {
                     continue;
                 }
 
-                var label = await option.EvaluateAsync<string>(
-                    "element => { const labels = Array.from(element.labels || []).map(item => item.innerText.trim()); " +
-                    "return [element.getAttribute('aria-label') || '', element.value || '', ...labels].filter(Boolean).join(' '); }");
-                if (AnswersEqual(answer, label))
+                var label = await GetRadioOptionLabelAsync(option);
+                var ariaLabel = (await option.GetAttributeAsync("aria-label") ?? "").Trim();
+                var value = (await option.GetAttributeAsync("value") ?? "").Trim();
+                var primaryLabel = !string.IsNullOrWhiteSpace(label) ? label
+                    : !string.IsNullOrWhiteSpace(ariaLabel) ? ariaLabel
+                    : value;
+                if (AnswersEqual(answer, primaryLabel))
                 {
                     matches.Add(option);
                 }
@@ -564,30 +793,15 @@ public static class ExternalApplicationFormAssistant
 
             if (matches.Count == 1)
             {
-                if (await matches[0].IsVisibleAsync())
-                {
-                    await matches[0].CheckAsync();
-                }
-                else
-                {
-                    var label = matches[0].Locator("xpath=ancestor::label[1]");
-                    if (await label.CountAsync() == 0 || !await label.IsVisibleAsync())
-                    {
-                        continue;
-                    }
-                    await label.ClickAsync();
-                }
-                if (await matches[0].IsCheckedAsync())
+                if (await CheckRadioOrLabelAsync(formRoot, matches[0]))
                 {
                     filledCount++;
                 }
             }
             else
             {
-                var options = await radio.EvaluateAsync<string>(
-                    "element => { const name = element.name; const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(item => item.name === name); " +
-                    "return radios.map(item => Array.from(item.labels || []).map(label => label.innerText.trim()).join(' ') || item.value).filter(Boolean).join(' | '); }");
-                Console.WriteLine($"  No unique option matched \"{answer}\" for \"{question}\". Choices: {options}");
+                var options = await GetRadioGroupOptionsAsync(radio);
+                Console.WriteLine($"  No unique option matched \"{answer}\" for \"{question}\". Choices: {string.Join(" | ", options)}");
             }
         }
 
@@ -604,7 +818,16 @@ public static class ExternalApplicationFormAssistant
             var checkboxLabel = checkbox.Locator("xpath=ancestor::label[1]");
             if (!checkboxVisible && (await checkboxLabel.CountAsync() == 0 || !await checkboxLabel.IsVisibleAsync()))
             {
-                continue;
+                var cbId = await checkbox.GetAttributeAsync("id");
+                if (string.IsNullOrWhiteSpace(cbId))
+                {
+                    continue;
+                }
+                var forLabel = formRoot.Locator($"label[for={JsonSerializer.Serialize(cbId)}]");
+                if (await forLabel.CountAsync() == 0 || !await forLabel.First.IsVisibleAsync())
+                {
+                    continue;
+                }
             }
 
             var question = await GetFieldQuestionAsync(checkbox);
@@ -614,15 +837,10 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
 
-            if (checkboxVisible)
+            if (await CheckRadioOrLabelAsync(formRoot, checkbox))
             {
-                await checkbox.CheckAsync();
+                filledCount++;
             }
-            else
-            {
-                await checkboxLabel.ClickAsync();
-            }
-            filledCount++;
         }
 
         var fields = formRoot.Locator(FieldSelector);
@@ -640,7 +858,7 @@ public static class ExternalApplicationFormAssistant
                 continue;
             }
 
-            await field.ScrollIntoViewIfNeededAsync();
+            await NoTimeoutPlaywright.SafeScrollIntoViewAsync(field);
 
             var current = await field.InputValueAsync();
             if (!string.IsNullOrWhiteSpace(current))
@@ -650,8 +868,8 @@ public static class ExternalApplicationFormAssistant
             if (string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
             {
                 var selectedValue = await field.EvaluateAsync<string>(
-                    "element => element.closest('.select__control')?.querySelector('[class*=\"single-value\"]')?.innerText || " +
-                    "element.parentElement?.parentElement?.querySelector('[class*=\"single-value\"]')?.innerText || ''");
+                    "element => element.closest('.select__control, [class*=\"control\"]')?.querySelector('[class*=\"single-value\"], [class*=\"singleValue\"], [class*=\"multi-value\"], [class*=\"multiValue\"]')?.innerText || " +
+                    "element.parentElement?.parentElement?.querySelector('[class*=\"single-value\"], [class*=\"singleValue\"]')?.innerText || ''");
                 if (!string.IsNullOrWhiteSpace(selectedValue))
                 {
                     continue;
@@ -668,7 +886,15 @@ public static class ExternalApplicationFormAssistant
             var tag = await field.EvaluateAsync<string>("element => element.tagName.toLowerCase()");
             if (tag == "select")
             {
-                var option = await FindMatchingSelectOptionAsync(field, answer);
+                var effectiveAnswer = answer;
+                var option = await FindMatchingSelectOptionAsync(field, effectiveAnswer);
+                if (option is null &&
+                    question.Contains("clearance", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(profile.ClearanceLevel))
+                {
+                    effectiveAnswer = profile.ClearanceLevel;
+                    option = await FindMatchingSelectOptionAsync(field, effectiveAnswer);
+                }
                 if (option is null)
                 {
                     var choices = await GetSelectOptionsAsync(field);
@@ -679,16 +905,24 @@ public static class ExternalApplicationFormAssistant
                     continue;
                 }
                 await field.SelectOptionAsync(option.Value.Value);
+                await field.EvaluateAsync(
+                    "(element, value) => { element.setAttribute('data-codex-answered', value); return true; }",
+                    effectiveAnswer);
+                filledCount++;
+                Console.WriteLine($"  Selected '{option.Value.Value}' for '{question}'.");
             }
             else if (string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
             {
                 try
                 {
-                    await field.ClickAsync(new LocatorClickOptions { Force = true });
-                    await field.FillAsync(answer);
-                    await field.PressAsync("ArrowDown");
+                    var controlContainer = field.Locator("xpath=ancestor::*[contains(@class, 'select__control')][1]");
+                    var clickTarget = await controlContainer.CountAsync() > 0 ? controlContainer.First : field;
+                    await NoTimeoutPlaywright.SafeScrollIntoViewAsync(clickTarget);
+                    await clickTarget.ClickAsync();
                     await page.WaitForTimeoutAsync(250);
-                    var options = page.Locator("[role='option'], .select__option");
+
+                    var effectiveComboAnswer = answer;
+                    var options = page.Locator("[role='option'], .select__option, div[class*='-option']");
                     var matchingOptions = new List<ILocator>();
                     var availableOptions = new List<string>();
                     for (var optionIndex = 0; optionIndex < await options.CountAsync(); optionIndex++)
@@ -702,30 +936,93 @@ public static class ExternalApplicationFormAssistant
                         if (label.Length > 0)
                         {
                             availableOptions.Add(label);
-                            if (AnswersEqual(answer, label))
+                            if (AnswersEqual(effectiveComboAnswer, label))
                             {
                                 matchingOptions.Add(option);
                             }
                         }
                     }
 
+                    if (matchingOptions.Count == 0 &&
+                        question.Contains("clearance", StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrWhiteSpace(profile.ClearanceLevel))
+                    {
+                        effectiveComboAnswer = profile.ClearanceLevel;
+                        for (var optionIndex = 0; optionIndex < await options.CountAsync(); optionIndex++)
+                        {
+                            var option = options.Nth(optionIndex);
+                            if (!await option.IsVisibleAsync())
+                            {
+                                continue;
+                            }
+                            var label = Regex.Replace(await option.InnerTextAsync(), @"\s+", " ").Trim();
+                            if (label.Length > 0 && AnswersEqual(effectiveComboAnswer, label))
+                            {
+                                matchingOptions.Add(option);
+                            }
+                        }
+                    }
+
+                    if (matchingOptions.Count == 0 && await options.CountAsync() > 5)
+                    {
+                        try
+                        {
+                            await field.FillAsync(effectiveComboAnswer);
+                            await page.WaitForTimeoutAsync(250);
+                            for (var optionIndex = 0; optionIndex < await options.CountAsync(); optionIndex++)
+                            {
+                                var option = options.Nth(optionIndex);
+                                if (!await option.IsVisibleAsync())
+                                {
+                                    continue;
+                                }
+                                var label = Regex.Replace(await option.InnerTextAsync(), @"\s+", " ").Trim();
+                                if (AnswersEqual(effectiveComboAnswer, label))
+                                {
+                                    matchingOptions.Add(option);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (matchingOptions.Count > 1)
+                    {
+                        var exactMatches = new List<ILocator>();
+                        foreach (var opt in matchingOptions)
+                        {
+                            var optText = Regex.Replace(await opt.InnerTextAsync(), @"\s+", " ").Trim();
+                            if (NormalizeOrdered(optText) == NormalizeOrdered(effectiveComboAnswer))
+                            {
+                                exactMatches.Add(opt);
+                            }
+                        }
+                        if (exactMatches.Count == 1)
+                        {
+                            matchingOptions = exactMatches;
+                        }
+                    }
+
                     if (matchingOptions.Count == 1)
                     {
                         await matchingOptions[0].ClickAsync();
+                        await field.EvaluateAsync(
+                            "(element, value) => { element.setAttribute('data-codex-answered', value); return true; }",
+                            effectiveComboAnswer);
                         filledCount++;
+                        Console.WriteLine($"  Selected '{effectiveComboAnswer}' for '{question}'.");
                     }
                     else
                     {
-                        await field.ClickAsync(new LocatorClickOptions { Force = true });
+                        await clickTarget.ClickAsync();
+                        await DismissLoseProgressDialogIfPresentAsync(page);
                         Console.WriteLine($"  Could not select a unique option for \"{question}\" from the available choices: {string.Join(" | ", availableOptions)}");
-                        await field.FillAsync("");
                     }
                 }
                 catch (Exception ex) when (ex is PlaywrightException or TimeoutException)
                 {
                     Console.WriteLine($"  Could not select a matching option for \"{question}\": {ex.Message}");
-                    try { await field.FillAsync(""); }
-                    catch (Exception clearError) when (clearError is PlaywrightException or TimeoutException) { }
+                    await DismissLoseProgressDialogIfPresentAsync(page);
                 }
             }
             else
@@ -744,10 +1041,11 @@ public static class ExternalApplicationFormAssistant
                 {
                     await field.FillAsync(answer);
                 }
-            }
-            if (!string.Equals(await field.GetAttributeAsync("role"), "combobox", StringComparison.OrdinalIgnoreCase))
-            {
+                await field.EvaluateAsync(
+                    "(element, value) => { element.setAttribute('data-codex-answered', value); return true; }",
+                    answer);
                 filledCount++;
+                Console.WriteLine($"  Filled '{question}'.");
             }
         }
 
@@ -758,25 +1056,310 @@ public static class ExternalApplicationFormAssistant
         return filledCount;
     }
 
+    private static string NormalizeOrdered(string text) =>
+        Regex.Replace(text ?? "", @"[^\p{L}\p{N}]+", " ").Trim().ToLowerInvariant();
+
     private static bool AnswersEqual(string answer, string option)
     {
-        var normalizedAnswer = AnswerMatcher.Normalize(answer);
-        var normalizedOption = AnswerMatcher.Normalize(option);
-        if (normalizedAnswer.Replace(" or ", " ", StringComparison.Ordinal) ==
-            normalizedOption.Replace(" or ", " ", StringComparison.Ordinal))
+        var normalizedAnswer = NormalizeOrdered(answer);
+        var normalizedOption = NormalizeOrdered(option);
+        if (string.IsNullOrWhiteSpace(normalizedAnswer) || string.IsNullOrWhiteSpace(normalizedOption))
         {
-            return normalizedAnswer.Length > 0;
+            return false;
         }
-        if ((normalizedAnswer == "male" && normalizedOption == "man") ||
-            (normalizedAnswer == "female" && normalizedOption == "woman"))
+
+        if (normalizedAnswer == normalizedOption ||
+            normalizedAnswer.Replace(" or ", " ", StringComparison.Ordinal) ==
+            normalizedOption.Replace(" or ", " ", StringComparison.Ordinal))
         {
             return true;
         }
-        return normalizedAnswer.Length > 0 &&
-            (normalizedAnswer == normalizedOption ||
-             normalizedOption.StartsWith(normalizedAnswer + " ", StringComparison.Ordinal) ||
-             normalizedOption.EndsWith(" " + normalizedAnswer, StringComparison.Ordinal));
+
+        if ((normalizedAnswer == "yes" || normalizedAnswer == "agree" || normalizedAnswer == "true") &&
+            (normalizedOption == "yes" || normalizedOption.StartsWith("yes ") || normalizedOption == "true" || normalizedOption == "1" ||
+             normalizedOption == "agree" || normalizedOption == "i agree" || normalizedOption == "i confirm" ||
+             normalizedOption == "confirm" || normalizedOption == "i acknowledge" || normalizedOption == "acknowledge" ||
+             normalizedOption == "acknowledged" || normalizedOption == "i accept" || normalizedOption == "accept" ||
+             normalizedOption.StartsWith("i confirm ") || normalizedOption.StartsWith("i acknowledge ") || normalizedOption.StartsWith("i agree ")))
+        {
+            return true;
+        }
+        if (normalizedAnswer == "no" &&
+            (normalizedOption == "no" || normalizedOption.StartsWith("no ") || normalizedOption == "false" || normalizedOption == "0" ||
+             normalizedOption.Contains("not a veteran", StringComparison.OrdinalIgnoreCase) ||
+             normalizedOption.Contains("not hispanic", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+        if ((normalizedAnswer == "not applicable" || normalizedAnswer == "n a") &&
+            (normalizedOption == "not applicable" || normalizedOption == "n a" || normalizedOption == "na" ||
+             normalizedOption.Contains("does not apply", StringComparison.Ordinal) ||
+             normalizedOption.Contains("not a california", StringComparison.Ordinal) ||
+             normalizedOption.Contains("do not reside in california", StringComparison.Ordinal) ||
+             normalizedOption.Contains("outside california", StringComparison.Ordinal) ||
+             normalizedOption.StartsWith("not applicable ", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        if ((normalizedAnswer == "male" && (normalizedOption == "man" || normalizedOption.StartsWith("man ") || normalizedOption.StartsWith("male "))) ||
+            (normalizedAnswer == "female" && (normalizedOption == "woman" || normalizedOption.StartsWith("woman ") || normalizedOption.StartsWith("female "))))
+        {
+            return true;
+        }
+
+        if (normalizedAnswer == "yes" &&
+            !normalizedOption.StartsWith("not ", StringComparison.Ordinal) &&
+            (normalizedOption.StartsWith("u s citizen", StringComparison.Ordinal) ||
+             normalizedOption.StartsWith("us citizen", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        var isDeclineAnswer = normalizedAnswer.Contains("don t wish") ||
+                              normalizedAnswer.Contains("do not wish") ||
+                              normalizedAnswer.Contains("decline") ||
+                              normalizedAnswer.Contains("prefer not") ||
+                              normalizedAnswer.Contains("choose not");
+        var isDeclineOption = normalizedOption.Contains("don t wish") ||
+                              normalizedOption.Contains("do not wish") ||
+                              normalizedOption.Contains("decline") ||
+                              normalizedOption.Contains("prefer not") ||
+                              normalizedOption.Contains("choose not") ||
+                              normalizedOption.Contains("not wish to") ||
+                              normalizedOption.Contains("do not provide");
+        if (isDeclineAnswer && isDeclineOption)
+        {
+            return true;
+        }
+
+        return normalizedOption.StartsWith(normalizedAnswer + " ", StringComparison.Ordinal) ||
+               normalizedOption.EndsWith(" " + normalizedAnswer, StringComparison.Ordinal);
     }
+
+    private static async Task<string> GetRadioGroupQuestionAsync(ILocator radio) =>
+        await radio.EvaluateAsync<string>(
+            """
+            element => {
+                const clean = text => (text || '').replace(/\s+/g, ' ').trim();
+                const isNoise = text => !text || /^[\*\u2022\-\s]+$/.test(text) || /^required$/i.test(text);
+
+                const name = element.getAttribute('name');
+                const nearestGroup = element.closest('fieldset, [role="radiogroup"], [role="group"]');
+                const radios = name
+                    ? Array.from(document.querySelectorAll('input[type="radio"]')).filter(r => r.getAttribute('name') === name)
+                    : (nearestGroup ? Array.from(nearestGroup.querySelectorAll('input[type="radio"]')) : [element]);
+
+                const optionLabelElements = new Set();
+                const optionTexts = new Set();
+                const recordOptionText = text => {
+                    const t = clean(text);
+                    if (t) optionTexts.add(t.toLowerCase());
+                };
+                for (const r of radios) {
+                    for (const lbl of Array.from(r.labels || [])) {
+                        optionLabelElements.add(lbl);
+                        recordOptionText(lbl.innerText || lbl.textContent);
+                    }
+                    const ancestorLabel = r.closest('label');
+                    if (ancestorLabel) {
+                        optionLabelElements.add(ancestorLabel);
+                        recordOptionText(ancestorLabel.innerText || ancestorLabel.textContent);
+                    }
+                    if (r.nextElementSibling && r.nextElementSibling.matches('label, span')) {
+                        optionLabelElements.add(r.nextElementSibling);
+                        recordOptionText(r.nextElementSibling.innerText || r.nextElementSibling.textContent);
+                    }
+                    recordOptionText(r.getAttribute('aria-label'));
+                    recordOptionText(r.value);
+                }
+
+                const isOptionText = text => {
+                    const lower = clean(text).toLowerCase();
+                    return isNoise(lower) || optionTexts.has(lower);
+                };
+
+                const resolveLabelledBy = node => {
+                    if (!node) return '';
+                    const ids = (node.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+                    return clean(ids.map(id => {
+                        const target = document.getElementById(id);
+                        return clean(target?.innerText || target?.textContent);
+                    }).filter(Boolean).join(' '));
+                };
+
+                if (nearestGroup) {
+                    const legend = clean(nearestGroup.querySelector('legend')?.innerText);
+                    if (!isOptionText(legend)) return legend;
+
+                    const labelledBy = resolveLabelledBy(nearestGroup);
+                    if (!isOptionText(labelledBy)) return labelledBy;
+
+                    const ariaLabel = clean(nearestGroup.getAttribute('aria-label'));
+                    if (!isOptionText(ariaLabel)) return ariaLabel;
+                }
+
+                const firstRadio = radios[0] || element;
+                let lca = firstRadio.parentElement;
+                while (lca && !radios.every(r => lca.contains(r))) {
+                    lca = lca.parentElement;
+                }
+
+                const extractPromptFromContainer = container => {
+                    if (!container) return '';
+                    const candidates = Array.from(container.querySelectorAll(
+                        'legend, h1, h2, h3, h4, h5, h6, p, label, [class*="label"], [class*="question"], [class*="title"], [class*="prompt"], span, div'));
+                    const usable = [];
+                    for (const node of candidates) {
+                        if (optionLabelElements.has(node)) continue;
+                        if (node.querySelector('input[type="radio"], input[type="checkbox"]')) continue;
+                        let insideOption = false;
+                        for (const optLbl of optionLabelElements) {
+                            if (optLbl.contains(node)) {
+                                insideOption = true;
+                                break;
+                            }
+                        }
+                        if (insideOption) continue;
+
+                        const t = clean(node.innerText || node.textContent);
+                        if (!isOptionText(t)) {
+                            usable.push({ node, text: t });
+                        }
+                    }
+
+                    // Prefer prompt elements that appear before the first radio button in DOM order.
+                    const preceding = usable.find(item =>
+                        (firstRadio.compareDocumentPosition(item.node) & Node.DOCUMENT_POSITION_PRECEDING) !== 0);
+                    if (preceding) return preceding.text;
+                    if (usable.length > 0) return usable[0].text;
+
+                    const lines = (container.innerText || '')
+                        .split('\n')
+                        .map(clean)
+                        .filter(line => !isOptionText(line));
+                    return lines[0] || '';
+                };
+
+                let node = lca;
+                for (let depth = 0; node && depth < 5 && node !== document.body; depth++, node = node.parentElement) {
+                    if (name) {
+                        const groupNames = new Set(
+                            Array.from(node.querySelectorAll('input[type="radio"]'))
+                                .map(r => r.getAttribute('name') || '')
+                                .filter(Boolean));
+                        if (groupNames.size > 1) {
+                            break;
+                        }
+                    }
+
+                    const prompt = extractPromptFromContainer(node);
+                    if (!isOptionText(prompt)) return prompt;
+
+                    const prev = node.previousElementSibling;
+                    if (prev && !prev.querySelector('input, select, textarea')) {
+                        const prevText = clean(prev.innerText || prev.textContent);
+                        if (!isOptionText(prevText)) return prevText;
+                    }
+                }
+
+                return clean(element.getAttribute('name')) || '';
+            }
+            """);
+
+    private static async Task<List<string>> GetRadioGroupOptionsAsync(ILocator radio) =>
+        [.. await radio.EvaluateAsync<string[]>(
+            """
+            element => {
+                const clean = text => (text || '').replace(/\s+/g, ' ').trim();
+                const name = element.getAttribute('name');
+                const nearestGroup = element.closest('fieldset, [role="radiogroup"], [role="group"]');
+                const radios = name
+                    ? Array.from(document.querySelectorAll('input[type="radio"]')).filter(r => r.getAttribute('name') === name)
+                    : (nearestGroup ? Array.from(nearestGroup.querySelectorAll('input[type="radio"]')) : [element]);
+                return radios.map(item => {
+                    const labels = Array.from(item.labels || []).map(l => clean(l.innerText || l.textContent)).filter(Boolean).join(' ');
+                    const ancestor = clean(item.closest('label')?.innerText || item.closest('label')?.textContent);
+                    const nextText = item.nextElementSibling && item.nextElementSibling.matches('label, span')
+                        ? clean(item.nextElementSibling.innerText || item.nextElementSibling.textContent)
+                        : '';
+                    return labels || ancestor || nextText || clean(item.getAttribute('aria-label')) || clean(item.value);
+                }).filter(Boolean);
+            }
+            """)];
+
+    private static async Task<string> GetRadioOptionLabelAsync(ILocator radio) =>
+        await radio.EvaluateAsync<string>(
+            """
+            el => {
+                const clean = text => (text || '').replace(/\s+/g, ' ').trim();
+                const labels = Array.from(el.labels || []).map(l => clean(l.innerText || l.textContent)).filter(Boolean).join(' ');
+                if (labels) return labels;
+                const ancestor = clean(el.closest('label')?.innerText || el.closest('label')?.textContent);
+                if (ancestor) return ancestor;
+                if (el.nextElementSibling && el.nextElementSibling.matches('label, span')) {
+                    const nextText = clean(el.nextElementSibling.innerText || el.nextElementSibling.textContent);
+                    if (nextText) return nextText;
+                }
+                return clean(el.getAttribute('aria-label')) || clean(el.value) || '';
+            }
+            """);
+
+    private static async Task<bool> CheckRadioOrLabelAsync(ILocator formRoot, ILocator radio)
+    {
+        ILocator? forLabel = null;
+        try
+        {
+            var radioId = await radio.GetAttributeAsync("id");
+            if (!string.IsNullOrWhiteSpace(radioId))
+            {
+                forLabel = formRoot.Locator($"label[for={JsonSerializer.Serialize(radioId)}]");
+            }
+        }
+        catch (PlaywrightException)
+        {
+        }
+
+        return await NoTimeoutPlaywright.SafeCheckAsync(radio, forLabel);
+    }
+
+    private static async Task<bool> IsFieldRequiredAsync(ILocator field, string question)
+    {
+        try
+        {
+            var isAttrRequired = await field.EvaluateAsync<bool>(
+                """
+                el => {
+                    if (el.required || el.getAttribute('aria-required') === 'true') return true;
+                    const labels = Array.from(el.labels || []).map(l => (l.innerText || '').trim());
+                    if (labels.some(t => t.includes('*'))) return true;
+                    const container = el.closest('.field, .form-field, .application-question, fieldset, [class*="field"], [class*="question"]');
+                    if (container) {
+                        const labelEl = container.querySelector('label, legend, [class*="label"]');
+                        if (labelEl && ((labelEl.innerText || '').includes('*') || labelEl.querySelector('.required, [class*="required"]'))) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                """);
+            if (isAttrRequired)
+            {
+                return true;
+            }
+        }
+        catch (PlaywrightException)
+        {
+        }
+
+        return question.Contains('*');
+    }
+
+    private static bool IsConditionalOrOptionalFollowUp(string question) =>
+        Regex.IsMatch(
+            question ?? "",
+            @"^\s*if\s+(?:you\s+answered|yes|applicable|other|so)\b|\(optional\)",
+            RegexOptions.IgnoreCase);
 
     private static async Task<string> GetFieldQuestionAsync(ILocator field) =>
         await field.EvaluateAsync<string>(
@@ -821,17 +1404,39 @@ public static class ExternalApplicationFormAssistant
         string answer)
     {
         var options = field.Locator("option");
+        SelectOptionValue? fallbackMatch = null;
+        var normalizedAnswer = NormalizeOrdered(answer);
         for (var index = 0; index < await options.CountAsync(); index++)
         {
             var option = options.Nth(index);
             var value = await option.GetAttributeAsync("value");
             var text = (await option.InnerTextAsync()).Trim();
-            if (string.Equals(text, answer, StringComparison.OrdinalIgnoreCase))
+            if (NormalizeOrdered(text) == normalizedAnswer)
             {
                 return new SelectOptionValue(value ?? text);
             }
+            if (fallbackMatch is null && AnswersEqual(answer, text))
+            {
+                fallbackMatch = new SelectOptionValue(value ?? text);
+            }
         }
-        return null;
+        return fallbackMatch;
+    }
+
+    public static async Task DismissLoseProgressDialogIfPresentAsync(IPage page)
+    {
+        try
+        {
+            if (page.IsClosed) return;
+            var keepEditing = page.Locator("button:has-text('Keep editing'), [role='dialog'] button:has-text('Keep editing')");
+            if (await keepEditing.CountAsync() > 0 && await keepEditing.First.IsVisibleAsync())
+            {
+                await keepEditing.First.ClickAsync();
+                Console.WriteLine("Dismissed 'Are you sure you want to lose your progress?' dialog by clicking Keep editing.");
+                await page.WaitForTimeoutAsync(200);
+            }
+        }
+        catch { }
     }
 
     private readonly record struct SelectOptionValue(string Value);
@@ -843,9 +1448,15 @@ public static class ResumeUploadAssistant
     private static readonly Regex OtherDocumentLabel = new(@"\b(cover letter|portfolio|transcript|writing sample|work sample)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex UploadLabel = new(@"\b(upload|attach|browse|choose file|select file)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-    public static async Task<int> UploadResumeAsync(ILocator formRoot, CancellationToken cancellationToken)
+    public static async Task<int> UploadResumeAsync(
+        ILocator formRoot,
+        CancellationToken cancellationToken,
+        string? preferredResumePath = null,
+        bool replaceExisting = false)
     {
-        var resumePath = FindResumePdfPath();
+        var resumePath = !string.IsNullOrWhiteSpace(preferredResumePath) && File.Exists(preferredResumePath)
+            ? preferredResumePath
+            : FindResumePdfPath();
         if (resumePath is null)
         {
             return 0;
@@ -866,13 +1477,31 @@ public static class ResumeUploadAssistant
             var description = await input.EvaluateAsync<string>(
                 """
                 element => {
+                    let isCoverLetter = false;
+                    let node = element;
+                    for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+                        const text = (node.innerText || '').toLowerCase();
+                        if (text.includes('cover letter') && !text.includes('resume/cv') && !text.includes('curriculum vitae')) {
+                            isCoverLetter = true;
+                            break;
+                        }
+                        if (node.previousElementSibling) {
+                            const prevText = (node.previousElementSibling.innerText || '').toLowerCase();
+                            if (prevText.includes('cover letter')) {
+                                isCoverLetter = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (isCoverLetter) return 'cover letter';
+
                     const labels = Array.from(element.labels || []).map(label => label.innerText || label.textContent || '').join(' ');
                     const pieces = [labels, element.getAttribute('aria-label') || '', element.getAttribute('name') || '', element.getAttribute('accept') || ''];
-                    let node = element.parentElement;
-                    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
-                        const text = (node.innerText || node.textContent || '').trim();
+                    let p = element.parentElement;
+                    for (let depth = 0; p && depth < 5; depth++, p = p.parentElement) {
+                        const text = (p.innerText || p.textContent || '').trim();
                         if (text && text.length < 600) pieces.push(text);
-                        if (node.matches('fieldset, [role="group"], [class*="form-field"], [class*="form-group"]')) break;
+                        if (p.matches('fieldset, [role="group"], [class*="form-field"], [class*="form-group"]')) break;
                     }
                     const container = element.closest('fieldset, [role="group"], [class*="form-field"], [class*="field"], .field');
                     if (container) {
@@ -886,6 +1515,7 @@ public static class ResumeUploadAssistant
         }
 
         var uploaded = 0;
+        var resumeFileName = Path.GetFileName(resumePath);
         foreach (var candidate in descriptions)
         {
             var description = candidate.Description;
@@ -897,15 +1527,28 @@ public static class ResumeUploadAssistant
                 continue;
             }
 
+            var alreadyUploaded = await candidate.Input.GetAttributeAsync("data-tailored-resume-path");
+            if (string.Equals(alreadyUploaded, resumePath, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             var existingFiles = await candidate.Input.EvaluateAsync<int>("element => element.files?.length || 0");
-            if (existingFiles > 0)
+            if (existingFiles > 0 && !replaceExisting)
             {
                 continue;
             }
 
             await candidate.Input.SetInputFilesAsync(resumePath);
+            try
+            {
+                await candidate.Input.EvaluateAsync("(el, p) => el.setAttribute('data-tailored-resume-path', p)", resumePath);
+            }
+            catch (PlaywrightException)
+            {
+            }
             uploaded++;
-            Console.WriteLine($"  Uploaded Resume.pdf to the resume/file upload field ({description.Split('|')[0].Trim()}).");
+            Console.WriteLine($"  Uploaded {resumeFileName} to the resume/file upload field ({description.Split('|')[0].Trim()}).");
         }
 
         return uploaded;

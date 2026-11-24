@@ -3,8 +3,12 @@ using System.Text.Json;
 
 static class AnswerMatcherTests
 {
-    public static async Task<int> Main()
+    public static async Task<int> Main(string[] args)
     {
+        if (args.Contains("--live-tailor", StringComparer.OrdinalIgnoreCase))
+        {
+            return await RunLiveTailorSmokeTestAsync();
+        }
         var tests = new (string Name, Action Run)[]
         {
             ("normalizes case and punctuation", NormalizesQuestions),
@@ -47,6 +51,8 @@ static class AnswerMatcherTests
         Console.WriteLine("PASS contact details must occur verbatim in the resume");
         await LeavesHighImpactFieldsManual();
         Console.WriteLine("PASS local model is not queried for high-impact questions");
+        ValidatesResumeTailorGuardrailsAndRendering();
+        Console.WriteLine("PASS resume tailor enforces factual guardrails and renders markdown/HTML");
         return 0;
     }
 
@@ -587,6 +593,95 @@ static class AnswerMatcherTests
         {
             Directory.Delete(directory, recursive: true);
         }
+    }
+
+    private static async Task<int> RunLiveTailorSmokeTestAsync()
+    {
+        var profilePath = PersonalProfile.FindPath(Environment.CurrentDirectory, AppContext.BaseDirectory);
+        var repoRoot = Path.GetDirectoryName(profilePath)!;
+        var profile = await PersonalProfile.LoadAsync(profilePath);
+        await using var tailor = await ResumeTailorService.CreateAsync(repoRoot, profile);
+        if (tailor is null)
+        {
+            Console.Error.WriteLine("ResumeTailorService is disabled or missing experience-bank.md / resume.md.");
+            return 1;
+        }
+
+        var sampleJob = new JobTailoringContext(
+            Platform: "SampleCheck",
+            JobTitle: "Staff Full-Stack Software Engineer (.NET / React / Azure)",
+            Company: "Acme Cloud Systems",
+            JobUrl: "https://example.com/jobs/staff-dotnet-react-azure",
+            JobDescription: """
+                We are hiring a Staff Full-Stack Software Engineer to lead architecture and end-to-end delivery across our cloud SaaS platform.
+                Required skills: C#, .NET Web API, React, TypeScript, Microsoft Azure, SQL Server / T-SQL, RESTful APIs, OpenAPI / Swagger, Microservices, Docker, Kubernetes, Terraform, CI/CD (GitHub Actions or Azure DevOps).
+                Bonus: AI-assisted engineering workflows, LLM developer tooling, automated TDD (xUnit, Jest), Kafka, CosmosDB.
+                You will partner with product and design from Agile story refinement through contract design, implementation, automated testing, and production release while mentoring engineering teams.
+                """);
+
+        var artifact = await tailor.TailorForJobAsync(sampleJob, CancellationToken.None);
+        if (artifact is null)
+        {
+            Console.Error.WriteLine("TailorForJobAsync returned null.");
+            return 1;
+        }
+
+        Console.WriteLine($"LIVE_TAILOR_PDF={artifact.PdfPath}");
+        Console.WriteLine($"LIVE_TAILOR_MD={artifact.MarkdownPath}");
+        Console.WriteLine($"LIVE_TAILOR_REPORT={artifact.ReportPath}");
+        return 0;
+    }
+
+    private static void ValidatesResumeTailorGuardrailsAndRendering()
+    {
+        var bank = """
+            # Master Experience Bank — Jane Doe
+            ## Contact
+            - Name: Jane Doe
+            - Email: jane@example.com
+            - LinkedIn: https://www.linkedin.com/in/janedoe/
+            - Phone: (555) 123-4567
+            - Location: Austin, TX 78701
+            ### Northstar Systems | San Francisco, CA | Lead Engineer | June 2024 – Present
+            ### Contoso Consulting | Dallas, TX | Principal Consultant | April 2021 – April 2024
+            *(Note: Do NOT attribute Python to Contoso Consulting.)*
+            """;
+
+        var contact = ExperienceBankParser.ParseContact(bank);
+        Equal("Jane Doe", contact.Name);
+        Equal("jane@example.com", contact.Email);
+        Equal("(555) 123-4567", contact.Phone);
+
+        var rawDoc = new TailoredResumeDocument(
+            TargetHeadline: "Lead .NET & Azure Engineer",
+            ProfessionalSummary: "Experienced .NET and Azure architect.",
+            MatchedKeywords: ["C#", ".NET", "Azure"],
+            MissingKeywordsNotClaimed: ["Rust"],
+            Skills: [new TailoredSkillCategory("Languages", ["C#", ".NET"])],
+            Experience:
+            [
+                new TailoredExperienceRole("Northstar Systems", "San Francisco, CA", "Lead Engineer", "June 2024 – Present",
+                    [new TailoredExperienceBullet("Scale", "Built automated delivery workflows across multi-service repos.")]),
+                new TailoredExperienceRole("Contoso Consulting", "Dallas, TX", "Principal Consultant", "April 2021 – April 2024",
+                    [new TailoredExperienceBullet("Stack", "Delivered C#, Python, and Azure platforms for clients.")]),
+                new TailoredExperienceRole("Invented Corp", "Remote", "CTO", "2020 – 2021",
+                    [new TailoredExperienceBullet("Fake", "Invented role.")])
+            ],
+            Education: [new TailoredEducationEntry("State University", "Austin, TX", "BS Computer Science", "2004 – 2006")],
+            Certifications: [new TailoredCertificationGroup("Microsoft", ["Azure Fundamentals"])]);
+
+        var (sanitized, warnings) = ResumeTailorValidator.ValidateAndSanitize(rawDoc, bank);
+        Equal(2, sanitized.Experience.Count);
+        Equal(false, sanitized.Experience[1].Bullets[0].Text.Contains("Python", StringComparison.OrdinalIgnoreCase));
+        Equal(true, warnings.Count >= 2);
+
+        var md = ResumeDocumentRenderer.ToMarkdown(contact, sanitized);
+        Equal(true, md.Contains("# **Jane Doe**", StringComparison.Ordinal));
+        Equal(true, md.Contains("Lead .NET & Azure Engineer", StringComparison.Ordinal));
+
+        var html = ResumeDocumentRenderer.ToHtml(contact, sanitized);
+        Equal(true, html.Contains("Jane Doe", StringComparison.Ordinal));
+        Equal(true, html.Contains("mailto:jane@example.com", StringComparison.Ordinal));
     }
 
     private static ConfirmedAnswer Entry(string question, string answer) =>

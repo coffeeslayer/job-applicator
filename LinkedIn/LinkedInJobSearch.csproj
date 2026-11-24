@@ -11,5 +11,7 @@
   <ItemGroup>
     <Compile Remove="tests/**/*.cs" />
     <Compile Include="..\Shared\PersonalProfile.cs" Link="PersonalProfile.cs" />
+    <Compile Include="..\Shared\RunnerLearning.cs" Link="RunnerLearning.cs" />
+    <Compile Include="..\Shared\ResumeTailor.cs" Link="ResumeTailor.cs" />
   </ItemGroup>
 </Project>

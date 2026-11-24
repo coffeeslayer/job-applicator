@@ -35,6 +35,7 @@ internal static class Program
         var personalProfilePath = PersonalProfile.FindPath(Environment.CurrentDirectory, AppContext.BaseDirectory);
         var personalProfile = await PersonalProfile.LoadAsync(personalProfilePath);
         var projectRoot = Path.GetDirectoryName(personalProfilePath)!;
+        using var logTee = ConsoleLogTee.Attach(projectRoot, "Glassdoor");
         var glassdoorDirectory = Path.Combine(projectRoot, "Glassdoor");
         var resumePath = Path.Combine(projectRoot, "resume.md");
         var resumeText = File.Exists(resumePath) ? await File.ReadAllTextAsync(resumePath) : "";
@@ -76,48 +77,56 @@ internal static class Program
         Console.WriteLine($"Applied jobs are tracked in {appliedJobsPath} ({appliedJobs.Count} recorded).");
         Console.WriteLine("The browser profile is local to your Windows account.");
 
-        using var playwright = await Playwright.CreateAsync();
+        IPlaywright? playwright = null;
         IBrowserContext? context = null;
+        ResumeTailorService? resumeTailor = null;
+        TaskCompletionSource? browserClosed = null;
+        IPage? activePage = null;
+        var keepOpenReason = "Glassdoor runner finished.";
         var keepJobPagesForTroubleshooting = false;
         try
         {
+            playwright = await Playwright.CreateAsync();
+            resumeTailor = await ResumeTailorService.CreateAsync(projectRoot, personalProfile, playwright);
             context = await playwright.Chromium.LaunchPersistentContextAsync(
                 profileDirectory,
-                new BrowserTypeLaunchPersistentContextOptions { Headless = false });
+                new BrowserTypeLaunchPersistentContextOptions { Headless = false, Timeout = 0 });
+            NoTimeoutPlaywright.Configure(context);
+            browserClosed = NoTimeoutPlaywright.TrackBrowserClose(context);
             var searchPage = context.Pages.FirstOrDefault() ?? await context.NewPageAsync();
+            NoTimeoutPlaywright.Configure(searchPage);
+            activePage = searchPage;
             Console.WriteLine($"Opening {MatchesUrl}");
-            await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
+            await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+            await WaitForHumanVerificationIfPresentAsync(searchPage, projectRoot, cancellation.Token);
             await AcceptCookiesIfPresentAsync(searchPage);
-            await WaitForSignInAsync(searchPage, TimeSpan.FromMinutes(5), cancellation.Token);
+            await WaitForSignInAsync(searchPage, projectRoot, cancellation.Token);
             if (!IsMatchesPage(searchPage.Url))
             {
-                await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
+                await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+                await WaitForHumanVerificationIfPresentAsync(searchPage, projectRoot, cancellation.Token);
             }
 
             Console.WriteLine();
-            Console.WriteLine("Glassdoor Recruiter matches are open.");
-            Console.WriteLine("Press Enter to scan the listings on this page.");
-            if (Console.ReadLine() is null)
-            {
-                return 0;
-            }
+            Console.WriteLine("Glassdoor Recruiter matches are open; scanning listings automatically.");
 
             var seenThisRun = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             while (!cancellation.IsCancellationRequested && !searchPage.IsClosed)
             {
                 if (!IsMatchesPage(searchPage.Url))
                 {
-                    await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
+                    await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
                 }
 
                 var listings = await ReadListingsAsync(searchPage);
                 if (listings.Count == 0)
                 {
-                    Console.WriteLine("No job links recognized yet; waiting up to 15 seconds for Glassdoor matches to finish loading...");
-                    listings = await WaitForListingsAsync(searchPage, TimeSpan.FromSeconds(15), cancellation.Token);
+                    Console.WriteLine("No job links recognized yet; waiting for Glassdoor matches to finish loading...");
+                    listings = await WaitForListingsAsync(searchPage, TimeSpan.FromSeconds(20), cancellation.Token);
                     if (listings.Count == 0)
                     {
                         await ReportListingDiagnosticsAsync(searchPage);
+                        await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(searchPage, projectRoot, "Glassdoor", "No Glassdoor job links recognized on matches page");
                     }
                 }
 
@@ -144,12 +153,16 @@ internal static class Program
                     }
 
                     Console.WriteLine();
-                    Console.WriteLine($"Opening: {listing.Title}");
+                    Console.WriteLine($"Opening: {listing.Title} ({listing.Url})");
                     var jobPage = await context.NewPageAsync();
+                    NoTimeoutPlaywright.Configure(jobPage);
                     IPage? applicationPopup = null;
+                    var keepCurrentJobTabs = false;
                     try
                     {
-                        await jobPage.GotoAsync(listing.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
+                        activePage = jobPage;
+                        await jobPage.GotoAsync(listing.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
+                        await jobPage.WaitForTimeoutAsync(800);
                         if (ShouldSkipApplicationUrl(jobPage.Url))
                         {
                             Console.WriteLine($"Skipping excluded application URL after navigation: {jobPage.Url}");
@@ -159,25 +172,42 @@ internal static class Program
                         var applyControls = await FindVisibleApplyControlsAsync(jobPage);
                         if (applyControls.Count == 1)
                         {
+                            TailoredResumeArtifact? tailoredResume = null;
+                            if (resumeTailor is not null)
+                            {
+                                var (jdText, company) = await JobDescriptionExtractor.ExtractFromPageAsync(jobPage, "Glassdoor", listing.Title);
+                                tailoredResume = await resumeTailor.TailorForJobAsync(
+                                    new JobTailoringContext("Glassdoor", listing.Title, company, jobPage.Url, jdText),
+                                    cancellation.Token);
+                            }
+
                             Console.WriteLine("Opening the unique Apply control. The app will fill recognized fields and submit when required fields are valid.");
                             var pagesBeforeApply = context.Pages.ToHashSet();
-                            await applyControls[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+                            await applyControls[0].ClickAsync();
                             await jobPage.WaitForTimeoutAsync(800);
                             applicationPopup = context.Pages.FirstOrDefault(page => !pagesBeforeApply.Contains(page));
+                            if (applicationPopup is not null)
+                            {
+                                NoTimeoutPlaywright.Configure(applicationPopup);
+                            }
                             var applicationPage = applicationPopup ?? jobPage;
+                            activePage = applicationPage;
                             if (ShouldSkipApplicationUrl(applicationPage.Url))
                             {
                                 Console.WriteLine($"Skipping excluded application URL: {applicationPage.Url}");
                                 continue;
                             }
 
+                            var effectiveResumeText = tailoredResume?.MarkdownText ?? resumeText;
                             var outcome = await CompleteApplicationAsync(
                                 applicationPage,
                                 personalProfile,
-                                string.IsNullOrWhiteSpace(resumeText) ? null : localModel,
-                                resumeText,
+                                string.IsNullOrWhiteSpace(effectiveResumeText) ? null : localModel,
+                                effectiveResumeText,
                                 listing.Title,
-                                cancellation.Token);
+                                projectRoot,
+                                cancellation.Token,
+                                tailoredResume?.PdfPath);
                             if (outcome == ApplicationOutcome.SubmittedConfirmed)
                             {
                                 appliedJobs.Add(listing.Key);
@@ -189,19 +219,32 @@ internal static class Program
                             if (outcome == ApplicationOutcome.NeedsManual)
                             {
                                 Console.WriteLine("Some questions were not supported by personal.md or resume.md. Leaving the form for manual review instead of submitting.");
+                                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(applicationPage, projectRoot, "Glassdoor", $"Needs manual review for {listing.Title}");
                             }
                             else if (outcome == ApplicationOutcome.SubmittedUnconfirmed)
                             {
                                 Console.WriteLine("Submit was clicked, but no confirmation message was detected. Check the page before recording it.");
+                                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(applicationPage, projectRoot, "Glassdoor", $"Submitted unconfirmed for {listing.Title}");
                             }
                         }
                         else if (applyControls.Count > 1)
                         {
-                            Console.WriteLine("Several Apply controls are visible; leaving the job page for you to choose.");
+                            Console.WriteLine($"Several Apply controls ({applyControls.Count}) are visible; leaving the job page for inspection.");
+                            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(jobPage, projectRoot, "Glassdoor", $"Multiple Apply controls ({applyControls.Count}) for {listing.Title}");
                         }
                         else
                         {
-                            Console.WriteLine("No unique Apply control was found; leaving the job page open for manual review.");
+                            Console.WriteLine("No unique Apply control was found; leaving the job page open for inspection.");
+                            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(jobPage, projectRoot, "Glassdoor", $"No Apply control found for {listing.Title}");
+                        }
+
+                        if (Console.IsInputRedirected)
+                        {
+                            keepCurrentJobTabs = true;
+                            keepJobPagesForTroubleshooting = true;
+                            keepOpenReason = $"Glassdoor paused on {listing.Title} for blocker evaluation.";
+                            Console.WriteLine(keepOpenReason);
+                            return 0;
                         }
 
                         Console.WriteLine("Complete the application in the browser if you want to apply.");
@@ -220,25 +263,36 @@ internal static class Program
                         }
                         else if (action is null)
                         {
+                            keepCurrentJobTabs = true;
+                            keepJobPagesForTroubleshooting = true;
+                            keepOpenReason = $"Console input ended while reviewing {listing.Title}.";
                             return 0;
                         }
                     }
                     catch
                     {
+                        keepCurrentJobTabs = true;
                         keepJobPagesForTroubleshooting = true;
                         throw;
                     }
                     finally
                     {
-                        if (!keepJobPagesForTroubleshooting && applicationPopup is not null && !applicationPopup.IsClosed)
+                        if (!keepCurrentJobTabs && !keepJobPagesForTroubleshooting && applicationPopup is not null && !applicationPopup.IsClosed)
                         {
                             await applicationPopup.CloseAsync();
                         }
-                        if (!keepJobPagesForTroubleshooting && !jobPage.IsClosed)
+                        if (!keepCurrentJobTabs && !keepJobPagesForTroubleshooting && !jobPage.IsClosed)
                         {
                             await jobPage.CloseAsync();
                         }
                     }
+                }
+
+                if (Console.IsInputRedirected)
+                {
+                    keepOpenReason = $"Glassdoor finished scanning {newListings.Count} listing(s).";
+                    Console.WriteLine(keepOpenReason);
+                    break;
                 }
 
                 Console.WriteLine();
@@ -255,27 +309,27 @@ internal static class Program
         }
         catch (OperationCanceledException)
         {
-            Console.WriteLine("Run cancelled.");
+            keepOpenReason = "Run cancelled.";
+            Console.WriteLine(keepOpenReason);
             return 0;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("Glassdoor runner failed with an exception:");
             Console.Error.WriteLine(ex.ToString());
-            if (context is not null)
-            {
-                Console.WriteLine("Chromium and the failed application tab are being kept open for troubleshooting. Press Enter after inspecting them to close the browser and exit.");
-                await Console.In.ReadLineAsync();
-            }
+            await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(activePage, projectRoot, "Glassdoor", $"Unhandled exception: {ex.Message}");
+            keepOpenReason = "Glassdoor runner stopped after an error.";
             return 1;
         }
         finally
         {
             Console.CancelKeyPress -= cancelHandler;
-            if (context is not null)
+            await NoTimeoutPlaywright.KeepBrowserOpenUntilClosedAsync(context, browserClosed, keepOpenReason);
+            if (resumeTailor is not null)
             {
-                await context.CloseAsync();
+                await resumeTailor.DisposeAsync();
             }
+            playwright?.Dispose();
             localModel?.Dispose();
         }
     }
@@ -315,7 +369,72 @@ internal static class Program
         }
     }
 
-    private static async Task WaitForSignInAsync(IPage page, TimeSpan timeout, CancellationToken cancellationToken)
+    private static async Task<bool> IsHumanVerificationChallengeAsync(IPage page)
+    {
+        if (page.IsClosed)
+        {
+            return false;
+        }
+        try
+        {
+            var title = await page.TitleAsync();
+            if (title.Contains("Just a moment", StringComparison.OrdinalIgnoreCase) ||
+                title.Contains("Attention Required", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            var body = await NoTimeoutPlaywright.SafeGetBodyTextAsync(page);
+            return body.Contains("Humans only", StringComparison.OrdinalIgnoreCase) ||
+                   body.Contains("Verify you are human", StringComparison.OrdinalIgnoreCase) ||
+                   body.Contains("Cloudflare", StringComparison.OrdinalIgnoreCase) && body.Contains("Ray ID", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (PlaywrightException)
+        {
+            // Navigation/refresh during Cloudflare challenge destroys execution context transiently;
+            // treat as still verifying so we never exit the wait loop prematurely.
+            return true;
+        }
+    }
+
+    private static async Task WaitForHumanVerificationIfPresentAsync(IPage page, string projectRoot, CancellationToken cancellationToken)
+    {
+        if (!await IsHumanVerificationChallengeAsync(page))
+        {
+            return;
+        }
+
+        Console.WriteLine("Glassdoor presented a human verification / Cloudflare security gate in the browser.");
+        Console.WriteLine("Complete the verification directly in the open browser window (no timeout — runner will resume automatically once cleared).");
+        await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Glassdoor", "Blocked by Glassdoor/Cloudflare human verification challenge");
+
+        var lastReminder = DateTimeOffset.UtcNow;
+        var consecutiveClearChecks = 0;
+        while (!page.IsClosed)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (await IsHumanVerificationChallengeAsync(page))
+            {
+                consecutiveClearChecks = 0;
+            }
+            else
+            {
+                consecutiveClearChecks++;
+                if (consecutiveClearChecks >= 3)
+                {
+                    Console.WriteLine("Glassdoor human verification cleared; continuing.");
+                    return;
+                }
+            }
+            if (DateTimeOffset.UtcNow - lastReminder > TimeSpan.FromSeconds(30))
+            {
+                lastReminder = DateTimeOffset.UtcNow;
+                Console.WriteLine($"Still waiting for human verification in Glassdoor browser (no timeout). Current page: {page.Url}");
+            }
+            await page.WaitForTimeoutAsync(1000);
+        }
+    }
+
+    private static async Task WaitForSignInAsync(IPage page, string projectRoot, CancellationToken cancellationToken)
     {
         if (!await IsSignedOutAsync(page))
         {
@@ -339,25 +458,30 @@ internal static class Program
             }
         }
 
-        Console.WriteLine("Complete Glassdoor sign-in or any verification in the Chromium window. The runner will continue after sign-in is detected.");
-        var deadline = DateTimeOffset.UtcNow + timeout;
-        while (DateTimeOffset.UtcNow < deadline)
+        Console.WriteLine("Complete Glassdoor sign-in or any verification in the Chromium window. No timeout — the runner will continue after sign-in is detected.");
+        var lastReminder = DateTimeOffset.UtcNow;
+        var dumped = false;
+        while (!page.IsClosed)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (page.IsClosed)
-            {
-                throw new PlaywrightException("The Glassdoor page was closed before sign-in.");
-            }
             if (!await IsSignedOutAsync(page) && Uri.TryCreate(page.Url, UriKind.Absolute, out var current) &&
                 current.Host.EndsWith("glassdoor.com", StringComparison.OrdinalIgnoreCase))
             {
                 Console.WriteLine("Glassdoor sign-in detected; continuing.");
                 return;
             }
+            if (DateTimeOffset.UtcNow - lastReminder > TimeSpan.FromSeconds(30))
+            {
+                lastReminder = DateTimeOffset.UtcNow;
+                Console.WriteLine($"Still waiting for Glassdoor sign-in in Chromium (no timeout). Current page: {page.Url}");
+                if (!dumped)
+                {
+                    dumped = true;
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Glassdoor", "Waiting for Glassdoor sign-in");
+                }
+            }
             await page.WaitForTimeoutAsync(1000);
         }
-
-        throw new PlaywrightException("Glassdoor sign-in was not detected within five minutes. Sign in in Chromium and rerun the command.");
     }
 
     private static async Task<bool> IsSignedOutAsync(IPage page)
@@ -402,21 +526,27 @@ internal static class Program
         var openers = signInLinks.Concat(signInButtons).ToList();
         if (openers.Count == 1 && !await HasVisibleEmailFieldAsync(page))
         {
-            await openers[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+            await openers[0].ClickAsync();
             await page.WaitForTimeoutAsync(800);
         }
 
         var emailField = page.Locator("input[type='email'], input[name='username'], input[autocomplete='username']").First;
-        try
+        var emailWaitStart = DateTimeOffset.UtcNow;
+        while (!page.IsClosed && DateTimeOffset.UtcNow - emailWaitStart < TimeSpan.FromSeconds(20))
         {
-            await emailField.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Visible, Timeout = 20_000 });
-            await emailField.FillAsync(email);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (await emailField.IsVisibleAsync())
+            {
+                break;
+            }
+            await page.WaitForTimeoutAsync(300);
         }
-        catch (PlaywrightException ex)
+        if (!await emailField.IsVisibleAsync())
         {
-            Console.WriteLine($"Glassdoor's email sign-in form was not available. Complete sign-in in the browser. ({ex.Message})");
+            Console.WriteLine("Glassdoor's email sign-in form was not available. Complete sign-in in the browser.");
             return;
         }
+        await emailField.FillAsync(email);
 
         if (!await HasVisiblePasswordFieldAsync(page))
         {
@@ -428,7 +558,7 @@ internal static class Program
                 Console.WriteLine("Glassdoor did not show a unique Continue button after the email. Complete sign-in in the browser.");
                 return;
             }
-            await continueButtons[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+            await continueButtons[0].ClickAsync();
         }
 
         var passwordField = page.Locator("input[type='password']").First;
@@ -459,7 +589,7 @@ internal static class Program
             return;
         }
 
-        await submitButtons[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+        await submitButtons[0].ClickAsync();
         Console.WriteLine("Glassdoor sign-in submitted. Waiting for the account session or additional verification in Chromium...");
     }
 
@@ -487,7 +617,7 @@ internal static class Program
 
         try
         {
-            await visible[0].ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+            await visible[0].ClickAsync();
             Console.WriteLine("Accepted the cookie prompt.");
         }
         catch (PlaywrightException ex)
@@ -619,7 +749,9 @@ internal static class Program
         LocalModelAnswerClient? localModel,
         string resumeText,
         string jobTitle,
-        CancellationToken cancellationToken)
+        string projectRoot,
+        CancellationToken cancellationToken,
+        string? tailoredResumePdfPath = null)
     {
         for (var step = 0; step < 6; step++)
         {
@@ -639,7 +771,8 @@ internal static class Program
                     resumeText,
                     personalProfile?.Residence,
                     cancellationToken,
-                    personalProfile);
+                    personalProfile,
+                    tailoredResumePdfPath);
             }
             catch (HttpRequestException ex)
             {
@@ -667,6 +800,8 @@ internal static class Program
                 {
                     Console.WriteLine($"  Unanswered: {question}");
                 }
+                await InteractiveBlockerResolver.WritePendingQuestionsAsync(projectRoot, "Glassdoor", jobTitle, page.Url, fillResult.UnansweredQuestions);
+                await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Glassdoor", $"Unanswered questions for {jobTitle}", fillResult.UnansweredQuestions);
                 return ApplicationOutcome.NeedsManual;
             }
 
@@ -684,16 +819,17 @@ internal static class Program
             }
             if (submitButtons.Count == 1)
             {
-                var invalidRequiredFields = page.Locator(
-                    "input:required:invalid, textarea:required:invalid, select:required:invalid, [aria-required='true'][aria-invalid='true']");
-                if (await invalidRequiredFields.CountAsync() > 0)
+                var invalidRequiredFields = await GetVisibleLocatorsAsync(page.Locator(
+                    "input:required:invalid, textarea:required:invalid, select:required:invalid, [aria-required='true'][aria-invalid='true']"));
+                if (invalidRequiredFields.Count > 0)
                 {
-                    Console.WriteLine($"Required application fields remain incomplete for {jobTitle}; leaving the form open for you.");
+                    Console.WriteLine($"Required application fields ({invalidRequiredFields.Count}) remain incomplete for {jobTitle}; leaving the form open for you.");
+                    await NoTimeoutPlaywright.DumpPageDiagnosticsAsync(page, projectRoot, "Glassdoor", $"Invalid required fields for {jobTitle}");
                     return ApplicationOutcome.NeedsManual;
                 }
 
                 Console.WriteLine($"Submitting the completed application for {jobTitle}.");
-                await submitButtons[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+                await submitButtons[0].ClickAsync();
                 return await WaitForConfirmationAsync(page, cancellationToken)
                     ? ApplicationOutcome.SubmittedConfirmed
                     : ApplicationOutcome.SubmittedUnconfirmed;
@@ -705,7 +841,7 @@ internal static class Program
                 return ApplicationOutcome.NeedsManual;
             }
 
-            await nextButtons[0].ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+            await nextButtons[0].ClickAsync();
             await page.WaitForTimeoutAsync(800);
         }
 
@@ -755,7 +891,7 @@ internal static class Program
     {
         if (!searchPage.IsClosed)
         {
-            await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
+            await searchPage.GotoAsync(MatchesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 0 });
             Console.WriteLine("Restored the Glassdoor Recruiter matches page.");
         }
     }
@@ -808,10 +944,17 @@ internal static class Program
         SubmittedUnconfirmed
     }
 
-    private sealed record ListingProbe(
-        [property: JsonPropertyName("href")] string Href,
-        [property: JsonPropertyName("text")] string Text,
-        [property: JsonPropertyName("cardText")] string CardText);
+    private sealed class ListingProbe
+    {
+        [JsonPropertyName("href")]
+        public string Href { get; set; } = "";
+
+        [JsonPropertyName("text")]
+        public string Text { get; set; } = "";
+
+        [JsonPropertyName("cardText")]
+        public string CardText { get; set; } = "";
+    }
 
     private sealed record JobListing(string Key, string Url, string Title, bool AlreadyApplied);
 }
